@@ -137,6 +137,21 @@ class EncoderActorCriticMixin:
                 exported_program.save(os.path.join(filedir, "encoder_actor_critic.onnx"))
                 print(f"Exported encoder_actor_critic to {os.path.join(filedir, 'encoder_actor_critic.onnx')}")
 
+    def export_as_jit(self, observations, filedir, encoder_as_seperate_file=True):
+        """Export the model as a TorchScript file. Input should be batch-wise observations with batchsize 1."""
+        self.eval()
+        if encoder_as_seperate_file:
+            self.encoders.export_as_jit(observations, filedir)
+            with torch.no_grad():
+                obs = self.encoders(observations)
+            super().export_as_jit(obs, filedir)
+        else:
+            with torch.no_grad():
+                traced = torch.jit.trace(self, observations)
+                save_path = os.path.join(filedir, "encoder_actor_critic.pt")
+                torch.jit.save(traced, save_path)
+                print(f"Exported encoder_actor_critic to {save_path}")
+
 
 from .actor_critic import ActorCritic
 

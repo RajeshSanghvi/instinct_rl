@@ -164,6 +164,31 @@ class ParallelLayer(nn.Module):
             for block_name in self._parallel_blocks.keys():
                 self.export_one_block_as_onnx(flat_input, filedir, block_name)
 
+    def export_as_jit(self, flat_input, filedir: str):
+        """Export each block as a TorchScript file. Input should be batch-wise observations with batchsize 1."""
+        self.eval()
+        with torch.no_grad():
+            for block_name in self._parallel_blocks.keys():
+                self.export_one_block_as_jit(flat_input, filedir, block_name)
+
+    def export_one_block_as_jit(self, flat_input, filedir, block_name):
+        block = self._parallel_blocks[block_name]
+        block_config = self.block_configs[block_name]
+        input_component_names = block_config["component_names"]
+        input_for_block = get_subobs_by_components(
+            flat_input,
+            input_component_names,
+            self.input_segments,
+            temporal=module_is_from_type(block, TransformerHeadModel),
+        )
+        if module_is_from_type(block, Conv2dHeadModel):
+            assert len(input_component_names) == 1, "Conv2dHeadModel only accept one obs component for now"
+            input_for_block = input_for_block.reshape(-1, *self.input_segments[input_component_names[0]])
+        traced = torch.jit.trace(block, input_for_block)
+        save_path = os.path.join(filedir, f"{self._sequential_idx}-{block_name}.pt")
+        torch.jit.save(traced, save_path)
+        print(f"Exported {block_name} to {save_path}")
+
     def export_one_block_as_onnx(self, flat_input, filedir, block_name):
         block = self._parallel_blocks[block_name]
         block_config = self.block_configs[block_name]

@@ -213,6 +213,15 @@ class ActorCritic(nn.Module):
             )
             print(f"Exported ActorCritic model to {os.path.join(filedir, 'actor.onnx')}")
 
+    def export_as_jit(self, observations, filedir):
+        """Export the actor as a TorchScript file. Input should be batch-wise observations with batchsize 1."""
+        self.eval()
+        with torch.no_grad():
+            traced = torch.jit.trace(self.actor, observations)
+            save_path = os.path.join(filedir, "actor.pt")
+            torch.jit.save(traced, save_path)
+            print(f"Exported ActorCritic model to {save_path}")
+
 
 def get_activation(act_name):
     if act_name == "elu":

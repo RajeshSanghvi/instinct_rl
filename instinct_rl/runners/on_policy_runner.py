@@ -486,6 +486,22 @@ class OnPolicyRunner:
             self.normalizers["policy"].export(os.path.join(export_model_dir, "policy_normalizer.npz"))
         self.alg.actor_critic.export_as_onnx(obs, export_model_dir)
 
+    def export_as_jit(self, obs, export_model_dir, encoder_as_seperate_file=True):
+        self.eval_mode()
+        if "policy" in self.normalizers:
+            obs = self.normalizers["policy"](obs)
+            # also export obs normalizer
+            self.normalizers["policy"].export(os.path.join(export_model_dir, "policy_normalizer.npz"))
+        try:
+            self.alg.actor_critic.export_as_jit(
+                obs,
+                export_model_dir,
+                encoder_as_seperate_file=encoder_as_seperate_file,
+            )
+        except TypeError:
+            # Fallback for actor_critic implementations without encoder split options.
+            self.alg.actor_critic.export_as_jit(obs, export_model_dir)
+
     """
     Helper functions
     """
