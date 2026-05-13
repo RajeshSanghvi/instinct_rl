@@ -89,6 +89,10 @@ class EncoderActorCriticMixin:
         obs = self.encoders(observations)
         return super().act(obs, **kwargs)
 
+    def encode_actor_obs(self, observations):
+        """Run only the actor encoders and return the concatenated latent. Gradient-enabled."""
+        return self.encoders(observations)
+
     def act_inference(self, observations):
         obs = self.encoders(observations)
         return super().act_inference(obs)

@@ -36,7 +36,11 @@ import torch.optim as optim
 
 from instinct_rl.modules import ActorCritic
 from instinct_rl.storage import RolloutStorage
-from instinct_rl.utils.utils import get_subobs_size
+from instinct_rl.utils.utils import (
+    get_subobs_by_components,
+    get_subobs_size,
+    replace_obs_components,
+)
 
 
 class PPO:
@@ -61,6 +65,8 @@ class PPO:
         schedule="fixed",
         desired_kl=0.01,
         auxiliary_reward_per_env_reward_coefs: list[float] = list(),
+        denoise_loss_coef=0.0,
+        denoise_depth_component_name="depth_image",
         device="cpu",
         **kwargs,
     ):
@@ -106,6 +112,30 @@ class PPO:
         self.clip_min_std = (
             torch.tensor(clip_min_std, device=self.device) if isinstance(clip_min_std, (tuple, list)) else clip_min_std
         )
+
+        # Denoise auxiliary loss
+        self.denoise_loss_coef = denoise_loss_coef
+        self.denoise_depth_component_name = denoise_depth_component_name
+        if self.denoise_loss_coef > 0:
+            assert hasattr(self.actor_critic, "encode_actor_obs"), (
+                "denoise_loss_coef > 0 requires an actor_critic exposing encode_actor_obs "
+                "(e.g. EncoderActorCritic / EncoderActorCriticRecurrent)."
+            )
+            assert hasattr(self.actor_critic, "obs_segments") and hasattr(
+                self.actor_critic, "critic_obs_segments"
+            ), "denoise loss requires actor_critic.obs_segments / critic_obs_segments."
+            assert self.denoise_depth_component_name in self.actor_critic.obs_segments, (
+                f"depth component '{self.denoise_depth_component_name}' not found in actor obs_segments: "
+                f"{list(self.actor_critic.obs_segments.keys())}"
+            )
+            assert self.denoise_depth_component_name in self.actor_critic.critic_obs_segments, (
+                f"depth component '{self.denoise_depth_component_name}' not found in critic_obs_segments: "
+                f"{list(self.actor_critic.critic_obs_segments.keys())}"
+            )
+            print(
+                f"\033[92m[PPO] Denoise auxiliary loss enabled "
+                f"(coef={self.denoise_loss_coef}, component='{self.denoise_depth_component_name}')\033[0m"
+            )
 
         # algorithm status
         self.current_learning_iteration = 0
@@ -295,6 +325,9 @@ class PPO:
         if entropy_batch is not None:
             return_["entropy"] = -entropy_batch.mean()
 
+        if self.denoise_loss_coef > 0:
+            return_["denoise_loss"] = self._compute_denoise_loss(minibatch)
+
         inter_vars = dict(
             ratio=ratio,
             surrogate=surrogate,
@@ -306,6 +339,28 @@ class PPO:
             inter_vars["value_clipped"] = value_clipped
 
         return return_, inter_vars, stats_
+
+    def _compute_denoise_loss(self, minibatch):
+        """Denoise auxiliary loss: encode noisy actor obs and the same obs with the
+        depth segment replaced by the clean depth from critic_obs, then MSE-align
+        the two latents to make the actor encoder noise-robust.
+        """
+        comp = self.denoise_depth_component_name
+        clean_depth_flat = get_subobs_by_components(
+            minibatch.critic_obs,
+            [comp],
+            self.actor_critic.critic_obs_segments,
+            cat=True,
+        )
+        clean_obs = replace_obs_components(
+            minibatch.obs.clone(),
+            [comp],
+            clean_depth_flat,
+            self.actor_critic.obs_segments,
+        )
+        z_noisy = self.actor_critic.encode_actor_obs(minibatch.obs)
+        z_clean = self.actor_critic.encode_actor_obs(clean_obs)
+        return nn.functional.mse_loss(z_noisy, z_clean)
 
     def state_dict(self):
         state_dict = {
