@@ -326,7 +326,9 @@ class PPO:
             return_["entropy"] = -entropy_batch.mean()
 
         if self.denoise_loss_coef > 0:
-            return_["denoise_loss"] = self._compute_denoise_loss(minibatch)
+            denoise_loss, denoise_stats = self._compute_denoise_loss(minibatch)
+            return_["denoise_loss"] = denoise_loss
+            stats_.update(denoise_stats)
 
         inter_vars = dict(
             ratio=ratio,
@@ -359,8 +361,14 @@ class PPO:
             self.actor_critic.obs_segments,
         )
         z_noisy = self.actor_critic.encode_actor_obs(minibatch.obs)
-        z_clean = self.actor_critic.encode_actor_obs(clean_obs)
-        return nn.functional.mse_loss(z_noisy, z_clean)
+        with torch.no_grad():
+            z_clean = self.actor_critic.encode_actor_obs(clean_obs)
+        loss = nn.functional.mse_loss(z_noisy, z_clean)
+        stats = dict(
+            denoise_z_noisy_std=z_noisy.detach().std(dim=0).mean(),
+            denoise_z_clean_diff=(z_noisy - z_clean).detach().norm(dim=-1).mean(),
+        )
+        return loss, stats
 
     def state_dict(self):
         state_dict = {
