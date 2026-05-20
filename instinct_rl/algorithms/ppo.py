@@ -66,6 +66,7 @@ class PPO:
         desired_kl=0.01,
         auxiliary_reward_per_env_reward_coefs: list[float] = list(),
         denoise_loss_coef=0.0,
+        feature_kl_loss_coef=0.0,
         denoise_depth_component_name="depth_image",
         device="cpu",
         **kwargs,
@@ -115,15 +116,16 @@ class PPO:
 
         # Denoise auxiliary loss
         self.denoise_loss_coef = denoise_loss_coef
+        self.feature_kl_loss_coef = feature_kl_loss_coef
         self.denoise_depth_component_name = denoise_depth_component_name
-        if self.denoise_loss_coef > 0:
+        if self.denoise_loss_coef > 0 or self.feature_kl_loss_coef > 0:
             assert hasattr(self.actor_critic, "encode_actor_obs"), (
-                "denoise_loss_coef > 0 requires an actor_critic exposing encode_actor_obs "
-                "(e.g. EncoderActorCritic / EncoderActorCriticRecurrent)."
+                "denoise_loss_coef / feature_kl_loss_coef > 0 require an actor_critic exposing "
+                "encode_actor_obs (e.g. EncoderActorCritic / EncoderActorCriticRecurrent)."
             )
             assert hasattr(self.actor_critic, "obs_segments") and hasattr(
                 self.actor_critic, "critic_obs_segments"
-            ), "denoise loss requires actor_critic.obs_segments / critic_obs_segments."
+            ), "auxiliary encoder losses require actor_critic.obs_segments / critic_obs_segments."
             assert self.denoise_depth_component_name in self.actor_critic.obs_segments, (
                 f"depth component '{self.denoise_depth_component_name}' not found in actor obs_segments: "
                 f"{list(self.actor_critic.obs_segments.keys())}"
@@ -133,8 +135,9 @@ class PPO:
                 f"{list(self.actor_critic.critic_obs_segments.keys())}"
             )
             print(
-                f"\033[92m[PPO] Denoise auxiliary loss enabled "
-                f"(coef={self.denoise_loss_coef}, component='{self.denoise_depth_component_name}')\033[0m"
+                f"\033[92m[PPO] Encoder auxiliary losses enabled "
+                f"(denoise_coef={self.denoise_loss_coef}, feature_kl_coef={self.feature_kl_loss_coef}, "
+                f"component='{self.denoise_depth_component_name}')\033[0m"
             )
 
         # algorithm status
@@ -325,10 +328,10 @@ class PPO:
         if entropy_batch is not None:
             return_["entropy"] = -entropy_batch.mean()
 
-        if self.denoise_loss_coef > 0:
-            denoise_loss, denoise_stats = self._compute_denoise_loss(minibatch)
-            return_["denoise_loss"] = denoise_loss
-            stats_.update(denoise_stats)
+        if self.denoise_loss_coef > 0 or self.feature_kl_loss_coef > 0:
+            encoder_losses, encoder_stats = self._compute_encoder_aux_losses(minibatch)
+            return_.update(encoder_losses)
+            stats_.update(encoder_stats)
 
         inter_vars = dict(
             ratio=ratio,
@@ -342,33 +345,57 @@ class PPO:
 
         return return_, inter_vars, stats_
 
-    def _compute_denoise_loss(self, minibatch):
-        """Denoise auxiliary loss: encode noisy actor obs and the same obs with the
-        depth segment replaced by the clean depth from critic_obs, then MSE-align
-        the two latents to make the actor encoder noise-robust.
+    def _compute_encoder_aux_losses(self, minibatch):
+        """Auxiliary losses on the actor encoder latent:
+
+        - ``denoise_loss``: MSE between the encoder output on the noisy actor obs
+          and on the same obs with the depth segment replaced by the clean depth
+          from ``critic_obs``. Makes the encoder noise-robust.
+        - ``feature_kl_loss``: KL( N(mu, diag(sigma^2)) || N(0, I) ) where mu,
+          sigma^2 are batch-wise empirical statistics of the noisy latent.
+          Prevents representation collapse.
         """
         comp = self.denoise_depth_component_name
-        clean_depth_flat = get_subobs_by_components(
-            minibatch.critic_obs,
-            [comp],
-            self.actor_critic.critic_obs_segments,
-            cat=True,
-        )
-        clean_obs = replace_obs_components(
-            minibatch.obs.clone(),
-            [comp],
-            clean_depth_flat,
-            self.actor_critic.obs_segments,
-        )
+        losses = dict()
+        stats = dict()
+
         z_noisy = self.actor_critic.encode_actor_obs(minibatch.obs)
-        with torch.no_grad():
-            z_clean = self.actor_critic.encode_actor_obs(clean_obs)
-        loss = nn.functional.mse_loss(z_noisy, z_clean)
-        stats = dict(
-            denoise_z_noisy_std=z_noisy.detach().std(dim=0).mean(),
-            denoise_z_clean_diff=(z_noisy - z_clean).detach().norm(dim=-1).mean(),
-        )
-        return loss, stats
+
+        if self.denoise_loss_coef > 0:
+            clean_depth_flat = get_subobs_by_components(
+                minibatch.critic_obs,
+                [comp],
+                self.actor_critic.critic_obs_segments,
+                cat=True,
+            )
+            clean_obs = replace_obs_components(
+                minibatch.obs.clone(),
+                [comp],
+                clean_depth_flat,
+                self.actor_critic.obs_segments,
+            )
+            with torch.no_grad():
+                z_clean = self.actor_critic.encode_actor_obs(clean_obs)
+            losses["denoise_loss"] = nn.functional.mse_loss(z_noisy, z_clean)
+            z_noisy_std_per_dim = z_noisy.detach().std(dim=0)
+            stats["denoise_z_noisy_std"] = z_noisy_std_per_dim.mean()
+            stats["denoise_z_noisy_std_min"] = z_noisy_std_per_dim.min()
+            stats["denoise_z_active_ratio"] = (z_noisy_std_per_dim > 1e-2).float().mean()
+            stats["denoise_z_clean_diff"] = (z_noisy - z_clean).detach().norm(dim=-1).mean()
+
+        if self.feature_kl_loss_coef > 0:
+            # Batch-wise empirical diagonal Gaussian: N(mu, diag(sigma^2)).
+            # KL(N(mu, diag(sigma^2)) || N(0, I)) = 0.5 * sum_j (mu_j^2 + sigma_j^2 - log sigma_j^2 - 1)
+            eps = 1e-6
+            mu = z_noisy.mean(dim=0)
+            var = z_noisy.var(dim=0, unbiased=False) + eps
+            kl_per_dim = 0.5 * (mu.pow(2) + var - var.log() - 1.0)
+            losses["feature_kl_loss"] = kl_per_dim.sum()
+            stats["feature_kl_mu_abs"] = mu.detach().abs().mean()
+            stats["feature_kl_var"] = var.detach().mean()
+            stats["feature_kl_var_min"] = var.detach().min()
+
+        return losses, stats
 
     def state_dict(self):
         state_dict = {
