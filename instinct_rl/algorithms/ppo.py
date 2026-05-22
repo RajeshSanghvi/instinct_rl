@@ -315,6 +315,9 @@ class PPO:
 
         # pack the losses and stats
         stats_ = dict()
+        if self.desired_kl != None and self.schedule == "adaptive":
+            stats_["policy_kl"] = kl_mean.detach()
+            stats_["policy_lr"] = torch.tensor(self.learning_rate, device=self.device)
         if value_loss.numel() > 1:
             for i in range(minibatch.advantages.shape[-1]):
                 stats_[f"advantage_{i}"] = minibatch.advantages[..., i].detach().mean()
@@ -345,23 +348,64 @@ class PPO:
 
         return return_, inter_vars, stats_
 
-    def _compute_encoder_aux_losses(self, minibatch):
-        """Auxiliary losses on the actor encoder latent:
+    def _get_encoder_latent_component_names(self, component_name):
+        encoders = getattr(self.actor_critic, "encoders", None)
+        output_segment = getattr(encoders, "output_segment", None)
+        block_configs = getattr(encoders, "block_configs", None)
+        if output_segment is None or block_configs is None:
+            return []
 
-        - ``denoise_loss``: MSE between the encoder output on the noisy actor obs
+        prefix = getattr(encoders, "_output_component_name_prefix", "parallel_latent_0_")
+        latent_names = []
+        for block_name, config in block_configs.items():
+            if component_name in config.get("component_names", []):
+                latent_name = prefix + block_name
+                if latent_name in output_segment:
+                    latent_names.append(latent_name)
+        return latent_names
+
+    def _compute_encoder_aux_losses(self, minibatch):
+        """Auxiliary losses on the actor *depth latent* (image features only).
+
+        ``encode_actor_obs`` returns the full encoder output, which concatenates
+        the encoded depth latent with the pass-through proprio/command/action
+        components. Both losses below operate strictly on the depth latent
+        sub-segment so that unencoded components do not dilute or distort them.
+
+        - ``denoise_loss``: MSE between the depth latent on the noisy actor obs
           and on the same obs with the depth segment replaced by the clean depth
           from ``critic_obs``. Makes the encoder noise-robust.
         - ``feature_kl_loss``: KL( N(mu, diag(sigma^2)) || N(0, I) ) where mu,
-          sigma^2 are batch-wise empirical statistics of the noisy latent.
+          sigma^2 are batch-wise empirical statistics of the noisy depth latent.
           Prevents representation collapse.
         """
         comp = self.denoise_depth_component_name
         losses = dict()
         stats = dict()
 
-        z_noisy = self.actor_critic.encode_actor_obs(minibatch.obs)
+        latent_names = self._get_encoder_latent_component_names(comp)
+        assert latent_names, (
+            f"could not resolve encoder latent component(s) for depth component '{comp}'. "
+            "Encoder auxiliary losses require a ParallelLayer encoder exposing 'output_segment' "
+            "and 'block_configs'."
+        )
+
+        z_noisy_full = self.actor_critic.encode_actor_obs(minibatch.obs)
+        # Keep only the encoded depth latent; drop pass-through proprio/command/action.
+        z_noisy: torch.Tensor = get_subobs_by_components(
+            z_noisy_full,
+            latent_names,
+            self.actor_critic.encoders.output_segment,
+            cat=True,
+        )
 
         if self.denoise_loss_coef > 0:
+            noisy_depth_flat = get_subobs_by_components(
+                minibatch.obs,
+                [comp],
+                self.actor_critic.obs_segments,
+                cat=True,
+            )
             clean_depth_flat = get_subobs_by_components(
                 minibatch.critic_obs,
                 [comp],
@@ -375,13 +419,21 @@ class PPO:
                 self.actor_critic.obs_segments,
             )
             with torch.no_grad():
-                z_clean = self.actor_critic.encode_actor_obs(clean_obs)
+                z_clean_full = self.actor_critic.encode_actor_obs(clean_obs)
+            z_clean: torch.Tensor = get_subobs_by_components(
+                z_clean_full,
+                latent_names,
+                self.actor_critic.encoders.output_segment,
+                cat=True,
+            )
             losses["denoise_loss"] = nn.functional.mse_loss(z_noisy, z_clean)
+
+            # Minimal diagnostics: enough to tell collapse / no-noise / true denoising apart.
             z_noisy_std_per_dim = z_noisy.detach().std(dim=0)
-            stats["denoise_z_noisy_std"] = z_noisy_std_per_dim.mean()
-            stats["denoise_z_noisy_std_min"] = z_noisy_std_per_dim.min()
-            stats["denoise_z_active_ratio"] = (z_noisy_std_per_dim > 1e-2).float().mean()
-            stats["denoise_z_clean_diff"] = (z_noisy - z_clean).detach().norm(dim=-1).mean()
+            stats["denoise_depth_latent_noisy_std"] = z_noisy_std_per_dim.mean()
+            stats["denoise_depth_latent_active_ratio"] = (z_noisy_std_per_dim > 1e-2).float().mean()
+            stats["denoise_depth_latent_diff_norm"] = (z_noisy - z_clean).detach().norm(dim=-1).mean()
+            stats["denoise_depth_input_diff_abs_mean"] = (noisy_depth_flat - clean_depth_flat).detach().abs().mean()
 
         if self.feature_kl_loss_coef > 0:
             # Batch-wise empirical diagonal Gaussian: N(mu, diag(sigma^2)).
@@ -391,9 +443,8 @@ class PPO:
             var = z_noisy.var(dim=0, unbiased=False) + eps
             kl_per_dim = 0.5 * (mu.pow(2) + var - var.log() - 1.0)
             losses["feature_kl_loss"] = kl_per_dim.sum()
-            stats["feature_kl_mu_abs"] = mu.detach().abs().mean()
             stats["feature_kl_var"] = var.detach().mean()
-            stats["feature_kl_var_min"] = var.detach().min()
+            stats["feature_kl_per_dim_mean"] = kl_per_dim.detach().mean()
 
         return losses, stats
 
