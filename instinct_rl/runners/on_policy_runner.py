@@ -42,6 +42,7 @@ import instinct_rl
 import instinct_rl.algorithms as algorithms
 import instinct_rl.modules as modules
 from instinct_rl.env import VecEnv
+from instinct_rl.modules.moe import collect_moe_gate_stats
 from instinct_rl.utils import ckpt_manipulator
 from instinct_rl.utils.utils import get_subobs_size, store_code_state
 
@@ -300,6 +301,10 @@ class OnPolicyRunner:
         for k, v in locs["stats"].items():
             v = self.gather_stat_values(v, "mean")
             self.writer_mp_add_scalar("Train/" + k, v.item(), self.current_learning_iteration)
+
+        moe_stats = collect_moe_gate_stats(self.alg.actor_critic, reset=True)
+        for k, v in moe_stats.items():
+            self.writer_mp_add_scalar("MoE/" + k, v, self.current_learning_iteration)
 
         self.writer_mp_add_scalar("Loss/learning_rate", self.alg.learning_rate, self.current_learning_iteration)
         self.writer_mp_add_scalar("Policy/mean_noise_std", mean_std.item(), self.current_learning_iteration)
