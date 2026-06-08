@@ -9,7 +9,7 @@ from .all_mixer import (
     EncoderStateAcRecurrent,
     EncoderVaeActorCritic,
 )
-from .discriminator import Discriminator
+from .discriminator import Discriminator, MultiDiscriminator
 from .encoder_actor_critic import EncoderActorCritic, EncoderActorCriticRecurrent
 from .moe_actor_critic import MoEActorCritic
 from .normalizer import (
