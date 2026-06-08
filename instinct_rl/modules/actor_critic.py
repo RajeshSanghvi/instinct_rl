@@ -238,6 +238,7 @@ def get_activation(act_name):
         return nn.Tanh()
     elif act_name == "sigmoid":
         return nn.Sigmoid()
+    elif act_name in ("silu", "SiLU"):
+        return nn.SiLU()
     else:
-        print("invalid activation function!")
-        return None
+        raise ValueError(f"invalid activation function: {act_name}")

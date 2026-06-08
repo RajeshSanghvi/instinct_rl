@@ -32,6 +32,7 @@ class TPPO(PPO):
         self,
         *args,
         teacher_logdir=None,
+        teacher_checkpoint=None,  # specific model file (name or path) to load; if None, load the latest model_*.pt
         teacher_policy_class_name="ActorCritic",
         teacher_policy=dict(),
         label_action_with_critic_obs=True,  # else, use actor obs
@@ -51,9 +52,12 @@ class TPPO(PPO):
         Args:
         - teacher_logdir: the log directory of the teacher policy. Must contain a model_...pt file and the
             params/agent.yaml file.
+        - teacher_checkpoint: the specific checkpoint to load from teacher_logdir. Can be a file name (e.g.
+            "model_1500.pt") or an absolute path. If None, the latest model_*.pt in teacher_logdir is used.
         """
         super().__init__(*args, **kwargs)
         self.teacher_logdir = teacher_logdir
+        self.teacher_checkpoint = teacher_checkpoint
         self.teacher_policy_cfg_dict = teacher_policy
         self.label_action_with_critic_obs = label_action_with_critic_obs
         self.teacher_act_prob = teacher_act_prob
@@ -98,13 +102,22 @@ class TPPO(PPO):
             )
 
     def load_teacher_policy(self):
-        # acquire the latest model file in the teacher logdir
-        model_files = [
-            file for file in os.listdir(self.teacher_logdir) if file.endswith(".pt") and file.startswith("model_")
-        ]
-        model_files.sort(key=lambda x: int(x.split(".")[0].split("_")[1]))
-        model_file = model_files[-1]
-        state_dict = torch.load(osp.join(self.teacher_logdir, model_file), map_location="cpu")
+        if self.teacher_checkpoint is not None:
+            # use the user-specified checkpoint (file name relative to teacher_logdir, or an absolute path)
+            model_path = (
+                self.teacher_checkpoint
+                if osp.isabs(self.teacher_checkpoint)
+                else osp.join(self.teacher_logdir, self.teacher_checkpoint)
+            )
+        else:
+            # acquire the latest model file in the teacher logdir
+            model_files = [
+                file for file in os.listdir(self.teacher_logdir) if file.endswith(".pt") and file.startswith("model_")
+            ]
+            model_files.sort(key=lambda x: int(x.split(".")[0].split("_")[1]))
+            model_path = osp.join(self.teacher_logdir, model_files[-1])
+        print(f"TPPO: loading teacher policy from {model_path}")
+        state_dict = torch.load(model_path, map_location="cpu")
         self.teacher_actor_critic.load_state_dict(state_dict["model_state_dict"])
 
         self.teacher_actor_critic.to(self.device)
