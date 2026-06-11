@@ -60,6 +60,7 @@ class PPO:
         optimizer_class_name="Adam",
         schedule="fixed",
         desired_kl=0.01,
+        critic_warmup_iterations=0,
         auxiliary_reward_per_env_reward_coefs: list[float] = list(),
         device="cpu",
         **kwargs,
@@ -67,6 +68,10 @@ class PPO:
         """
 
         Args:
+            critic_warmup_iterations: for the first N learning iterations, only value_loss is optimized
+                (all other loss coefficients are zeroed, so the actor stays frozen). Useful when the critic
+                is loaded from a checkpoint trained under a different policy and must re-fit V^pi before
+                policy updates. During warmup, value clipping and the adaptive-KL lr schedule are suspended.
             auxiliary_reward_per_env_reward_coefs: list of float, the coefficients for each of the auxiliary reward.
                 The length of the list should be the same as the number of rewards from the environment (in case of multi-critic setting).
         """
@@ -106,6 +111,7 @@ class PPO:
         self.clip_min_std = (
             torch.tensor(clip_min_std, device=self.device) if isinstance(clip_min_std, (tuple, list)) else clip_min_std
         )
+        self.critic_warmup_iterations = critic_warmup_iterations
 
         # algorithm status
         self.current_learning_iteration = 0
@@ -186,6 +192,13 @@ class PPO:
 
     def update(self, current_learning_iteration):
         self.current_learning_iteration = current_learning_iteration
+        in_critic_warmup = current_learning_iteration < self.critic_warmup_iterations
+        if in_critic_warmup:
+            # With the actor frozen the policy KL stays ~0, which would make the adaptive schedule
+            # ramp the lr up to its ceiling; value clipping would anchor the critic to its stale
+            # loaded predictions. Suspend both for the warmup updates.
+            schedule_backup, self.schedule = self.schedule, "fixed"
+            value_clip_backup, self.use_clipped_value_loss = self.use_clipped_value_loss, False
         mean_losses = defaultdict(float)
         average_stats = defaultdict(float)
         if self.actor_critic.is_recurrent:
@@ -197,7 +210,10 @@ class PPO:
 
             loss = 0.0
             for k, v in losses.items():
-                loss += getattr(self, k + "_coef", 1.0) * v
+                coef = getattr(self, k + "_coef", 1.0)
+                if in_critic_warmup and k != "value_loss":
+                    coef = 0.0
+                loss += coef * v
                 mean_losses[k] = mean_losses[k] + v.detach()
             mean_losses["total_loss"] = mean_losses["total_loss"] + loss.detach()
             for k, v in stats.items():
@@ -214,6 +230,9 @@ class PPO:
         self.storage.clear()
         if hasattr(self.actor_critic, "clip_std"):
             self.actor_critic.clip_std(min=self.clip_min_std)
+        if in_critic_warmup:
+            self.schedule = schedule_backup
+            self.use_clipped_value_loss = value_clip_backup
 
         return mean_losses, average_stats
 
