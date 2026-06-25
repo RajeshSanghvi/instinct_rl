@@ -74,13 +74,17 @@ class ParallelLayer(nn.Module):
             )
         elif model_class_name == "Conv2dHeadModel":
             assert len(input_component_shapes) == 1, "Conv2dHeadModel only accept one obs component for now"
-            hidden_sizes = model_kwargs.pop("hidden_sizes") + [
-                output_size,
-            ]
+            hidden_sizes = model_kwargs.pop("hidden_sizes")
+            final_nonlinearity = model_kwargs.pop("final_nonlinearity", True)
+            if final_nonlinearity:
+                hidden_sizes = hidden_sizes + [
+                    output_size,
+                ]
+                output_size = None
             model = Conv2dHeadModel(
                 input_component_shapes[0],
                 hidden_sizes=hidden_sizes,
-                output_size=None,
+                output_size=output_size,
                 **model_kwargs,
             )
         elif model_class_name == "TransformerHeadModel":
