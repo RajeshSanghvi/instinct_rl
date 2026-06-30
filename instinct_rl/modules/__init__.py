@@ -5,9 +5,11 @@ from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .all_mixer import (
     EncoderMoEActorCritic,
+    EncoderMoEActorCriticRecurrent,
     EncoderStateAc,
     EncoderStateAcRecurrent,
     EncoderVaeActorCritic,
+    MoEActorCriticRecurrent,
 )
 from .discriminator import Discriminator
 from .encoder_actor_critic import EncoderActorCritic, EncoderActorCriticRecurrent

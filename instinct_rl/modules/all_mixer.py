@@ -21,5 +21,13 @@ class EncoderMoEActorCritic(EncoderActorCriticMixin, MoEActorCritic):
     pass
 
 
+class MoEActorCriticRecurrent(ActorCriticRecurrent, MoEActorCritic):
+    pass
+
+
+class EncoderMoEActorCriticRecurrent(EncoderActorCriticMixin, MoEActorCriticRecurrent):
+    pass
+
+
 class EncoderVaeActorCritic(EncoderActorCriticMixin, VaeActorCritic):
     pass

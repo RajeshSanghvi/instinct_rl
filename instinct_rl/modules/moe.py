@@ -46,8 +46,10 @@ class MoeLayer(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        gate_scores = F.softmax(self.gate(x), dim=-1)  # [batch, num_experts] # gate the expert outputs
-        expert_outputs = [expert(x) for expert in self.experts]
+        leading_shape = x.shape[:-1]
+        x_flat = x.reshape(-1, x.shape[-1])
+        gate_scores = F.softmax(self.gate(x_flat), dim=-1)  # [batch, num_experts]
+        expert_outputs = [expert(x_flat) for expert in self.experts]
         expert_outputs = torch.stack(expert_outputs, dim=1)  # [batch, num_experts, output_dim]
         output = torch.einsum("be,beo->bo", gate_scores, expert_outputs)  # mix the expert outputs
-        return output
+        return output.reshape(*leading_shape, -1)
