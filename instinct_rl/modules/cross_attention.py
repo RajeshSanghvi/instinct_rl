@@ -61,7 +61,10 @@ class CrossAttnFuseHeadModel(nn.Module):
         num_heads: Number of attention heads.
         num_self_attn_layers: Number of stacked pre-norm self-attention layers
             applied to the image tokens before cross-attention.
-        ffn_expansion: Hidden-size multiplier for the FFN and info MLP.
+        ffn_expansion: Hidden-size multiplier for the self-attention FFN.
+        info_hidden_sizes: Hidden layer widths of the proprioceptive query MLP
+            (info -> query token). The output is always ``d_model``. Defaults to
+            ``[d_model * ffn_expansion]`` (one hidden layer).
         nonlinearity: Activation module (or its name in ``torch.nn``).
         use_maxpool: Whether the conv tokenizer uses max-pooling for downsampling.
     """
@@ -78,6 +81,7 @@ class CrossAttnFuseHeadModel(nn.Module):
         num_heads: int = 4,
         num_self_attn_layers: int = 1,
         ffn_expansion: int = 2,
+        info_hidden_sizes=None,
         nonlinearity=nn.ELU,
         use_maxpool: bool = False,
     ) -> None:
@@ -120,12 +124,17 @@ class CrossAttnFuseHeadModel(nn.Module):
         )
 
         # --- proprio path: info -> single query token ---
-        self.info_proj = nn.Sequential(
-            nn.Linear(info_dim, expand_dim),
-            nonlinearity(),
-            nn.Linear(expand_dim, d_model),
-            nonlinearity(),
-        )
+        # Hidden widths are configurable; the output dim is forced to d_model so
+        # that the query matches the image key/value embedding dim. Default keeps
+        # the previous behaviour: a single hidden layer of size d_model*ffn_expansion.
+        if info_hidden_sizes is None:
+            info_hidden_sizes = [expand_dim]
+        info_dims = [info_dim] + list(info_hidden_sizes) + [d_model]
+        info_layers = []
+        for in_dim, out_dim in zip(info_dims[:-1], info_dims[1:]):
+            info_layers.append(nn.Linear(in_dim, out_dim))
+            info_layers.append(nonlinearity())
+        self.info_proj = nn.Sequential(*info_layers)
 
         # cross-attention sub-layer (proprio query, image key/value)
         self.cross_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
