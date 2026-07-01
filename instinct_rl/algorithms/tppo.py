@@ -87,6 +87,7 @@ class TPPO(PPO):
             self.teacher_policy_cfg_dict["num_actions"],
             self.teacher_policy_cfg_dict["num_rewards"],
         )
+        self.teacher_policy_normalizer = None
         if not self.teacher_logdir is None:
             self.load_teacher_policy()
         else:

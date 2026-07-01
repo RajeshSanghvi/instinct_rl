@@ -173,12 +173,32 @@ class Memory(torch.nn.Module):
             out = out.squeeze(0)  # remove the time dimension
         return out
 
+    @staticmethod
+    def _reset_tensor_hidden_state(hidden_state, dones):
+        hidden_state = hidden_state.detach()
+        if dones is None:
+            return torch.zeros_like(hidden_state)
+
+        dones = dones.to(device=hidden_state.device, dtype=torch.bool).reshape(-1)
+        if dones.numel() != hidden_state.shape[1]:
+            raise ValueError(
+                f"Expected dones to have {hidden_state.shape[1]} elements, got {dones.numel()}."
+            )
+        if dones.any():
+            hidden_state = hidden_state.clone()
+            hidden_state[:, dones, :] = 0.0
+        return hidden_state
+
     def reset(self, dones=None):
-        # When the RNN is an LSTM, self.hidden_states_a is a list with hidden_state and cell_state
         if self.hidden_states is None:
             return
-        for hidden_state in self.hidden_states:
-            hidden_state[..., dones, :] = 0.0
+        if isinstance(self.hidden_states, LstmHiddenState):
+            self.hidden_states = LstmHiddenState(
+                hidden=self._reset_tensor_hidden_state(self.hidden_states.hidden, dones),
+                cell=self._reset_tensor_hidden_state(self.hidden_states.cell, dones),
+            )
+        else:
+            self.hidden_states = self._reset_tensor_hidden_state(self.hidden_states, dones)
 
     @property
     def num_layers(self):
@@ -195,6 +215,9 @@ class MemoryList(torch.nn.ModuleList):
 
     def _update_hidden_states(self):
         hidden_states = [memory.hidden_states for memory in self]
+        if any(hidden_state is None for hidden_state in hidden_states):
+            self.hidden_states = None
+            return
 
         if isinstance(self[0].rnn, nn.GRU):
             self.hidden_states = torch.cat(hidden_states, dim=0)
@@ -220,6 +243,7 @@ class MemoryList(torch.nn.ModuleList):
     def reset(self, dones=None):
         for memory in self:
             memory.reset(dones)
+        self._update_hidden_states()
 
     def __str__(self):
         return f"MemoryList({len(self)} duplicated memories): {self[0]}"
