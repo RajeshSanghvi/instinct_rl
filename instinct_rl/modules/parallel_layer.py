@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from instinct_rl.modules.conv2d import Conv2dHeadModel
+from instinct_rl.modules.cross_attention import CrossAttnFuseHeadModel
 from instinct_rl.modules.mlp import MlpModel
 from instinct_rl.modules.transformer import TransformerHeadModel
 from instinct_rl.utils.utils import (
@@ -93,6 +94,21 @@ class ParallelLayer(nn.Module):
                 output_size=output_size,
                 **model_kwargs,
             )
+        elif model_class_name == "CrossAttnFuseHeadModel":
+            assert len(input_component_shapes) == 1, "CrossAttnFuseHeadModel only accepts one image component"
+            # proprioceptive components that form the cross-attention query.
+            # They are NOT taken out of the obs (only the image component is), so
+            # they still flow to the downstream network.
+            info_component_names = model_kwargs.pop("info_component_names")
+            info_dim = int(sum(np.prod(input_segments[name]) for name in info_component_names))
+            model = CrossAttnFuseHeadModel(
+                image_shape=input_component_shapes[0],
+                info_dim=info_dim,
+                output_size=output_size,
+                **model_kwargs,
+            )
+            # stored for _run_one_block to fetch the query input at forward time
+            model.info_components = list(info_component_names)
         else:
             model = None  # leave for subclass to implement
         return model
@@ -138,6 +154,15 @@ class ParallelLayer(nn.Module):
         return torch.cat(outputs, dim=-1)
 
     def _run_one_block(self, flat_input, input_segments, input_component_names, block):
+        if module_is_from_type(block, CrossAttnFuseHeadModel):
+            # image path: (..., C*H*W) -> (N, C, H, W)
+            img = get_subobs_by_components(flat_input, input_component_names, input_segments)
+            img = img.reshape(-1, *input_segments[input_component_names[0]])
+            # proprio query path: (..., info_dim) -> (N, info_dim)
+            info_components = block.module.info_components if hasattr(block, "module") else block.info_components
+            info = get_subobs_by_components(flat_input, info_components, input_segments)
+            info = info.reshape(-1, info.shape[-1])
+            return block(img, info)
         input_for_block = get_subobs_by_components(
             flat_input,
             input_component_names,
