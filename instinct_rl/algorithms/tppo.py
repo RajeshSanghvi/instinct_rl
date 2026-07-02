@@ -179,8 +179,11 @@ class TPPO(PPO):
 
         # decide whose action to use
         if not hasattr(self, "use_teacher_act_mask"):
-            self.use_teacher_act_mask = torch.ones(obs.shape[0], device=self.device, dtype=torch.bool)
+            self.use_teacher_act_mask = torch.rand(obs.shape[0], device=self.device) < self.teacher_act_prob(
+                self.current_learning_iteration
+            )
         return_[self.use_teacher_act_mask] = self.transition.action_labels[self.use_teacher_act_mask]
+        self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
 
         return return_
 
@@ -188,9 +191,12 @@ class TPPO(PPO):
         return_ = super().process_env_step(rewards, dones, infos, next_obs, next_critic_obs)
         self.teacher_actor_critic.reset(dones)
         # resample teacher action mask for those dones env
-        self.use_teacher_act_mask[dones.to(bool)] = torch.rand(dones.sum(), device=self.device) < self.teacher_act_prob(
-            self.current_learning_iteration
-        )
+        done_mask = dones.to(torch.bool).view(-1)
+        done_count = int(done_mask.sum().item())
+        if done_count > 0:
+            self.use_teacher_act_mask[done_mask] = torch.rand(done_count, device=self.device) < self.teacher_act_prob(
+                self.current_learning_iteration
+            )
         return return_
 
     def collect_transition_from_dataset(self, transition, infos):
@@ -277,7 +283,7 @@ class TPPO(PPO):
         return dist_loss
 
     def compute_losses(self, minibatch):
-        if self.hidden_state_resample_prob > 0.0:
+        if self.hidden_state_resample_prob > 0.0 and minibatch.hidden_states is not None:
             # assuming the hidden states are from LSTM or GRU, which are always betwein -1 and 1
             hidden_state_example = (
                 minibatch.hidden_states[0][0]
@@ -295,7 +301,7 @@ class TPPO(PPO):
                     hidden_states=tuple(
                         tuple(
                             torch.where(
-                                resample_mask.unsqueeze(-1).unsqueeze(-1),
+                                resample_mask.unsqueeze(0).unsqueeze(-1),
                                 torch.rand_like(minibatch.hidden_states[i][j], device=self.device) * 2 - 1,
                                 minibatch.hidden_states[i][j],
                             )
