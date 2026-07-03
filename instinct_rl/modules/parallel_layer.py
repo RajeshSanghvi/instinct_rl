@@ -153,15 +153,20 @@ class ParallelLayer(nn.Module):
                 )
         return torch.cat(outputs, dim=-1)
 
+    def _cross_attn_block_inputs(self, flat_input, input_component_names, block):
+        """Build the (img, info) input tuple for a CrossAttnFuseHeadModel block."""
+        # image path: (..., C*H*W) -> (N, C, H, W)
+        img = get_subobs_by_components(flat_input, input_component_names, self.input_segments)
+        img = img.reshape(-1, *self.input_segments[input_component_names[0]])
+        # proprio query path: (..., info_dim) -> (N, info_dim)
+        info_components = block.module.info_components if hasattr(block, "module") else block.info_components
+        info = get_subobs_by_components(flat_input, info_components, self.input_segments)
+        info = info.reshape(-1, info.shape[-1])
+        return img, info
+
     def _run_one_block(self, flat_input, input_segments, input_component_names, block):
         if module_is_from_type(block, CrossAttnFuseHeadModel):
-            # image path: (..., C*H*W) -> (N, C, H, W)
-            img = get_subobs_by_components(flat_input, input_component_names, input_segments)
-            img = img.reshape(-1, *input_segments[input_component_names[0]])
-            # proprio query path: (..., info_dim) -> (N, info_dim)
-            info_components = block.module.info_components if hasattr(block, "module") else block.info_components
-            info = get_subobs_by_components(flat_input, info_components, input_segments)
-            info = info.reshape(-1, info.shape[-1])
+            img, info = self._cross_attn_block_inputs(flat_input, input_component_names, block)
             return block(img, info)
         input_for_block = get_subobs_by_components(
             flat_input,
@@ -204,15 +209,20 @@ class ParallelLayer(nn.Module):
         block = self._parallel_blocks[block_name]
         block_config = self.block_configs[block_name]
         input_component_names = block_config["component_names"]
-        input_for_block = get_subobs_by_components(
-            flat_input,
-            input_component_names,
-            self.input_segments,
-            temporal=module_is_from_type(block, TransformerHeadModel),
-        )
-        if module_is_from_type(block, Conv2dHeadModel):
-            assert len(input_component_names) == 1, "Conv2dHeadModel only accept one obs component for now"
-            input_for_block = input_for_block.reshape(-1, *self.input_segments[input_component_names[0]])
+        if module_is_from_type(block, CrossAttnFuseHeadModel):
+            # two-input block: the traced module keeps the (image, info) signature,
+            # so the deployment side must feed the proprio query as a second input.
+            input_for_block = self._cross_attn_block_inputs(flat_input, input_component_names, block)
+        else:
+            input_for_block = get_subobs_by_components(
+                flat_input,
+                input_component_names,
+                self.input_segments,
+                temporal=module_is_from_type(block, TransformerHeadModel),
+            )
+            if module_is_from_type(block, Conv2dHeadModel):
+                assert len(input_component_names) == 1, "Conv2dHeadModel only accept one obs component for now"
+                input_for_block = input_for_block.reshape(-1, *self.input_segments[input_component_names[0]])
         traced = torch.jit.trace(block, input_for_block)
         save_path = os.path.join(filedir, f"{self._sequential_idx}-{block_name}.pt")
         torch.jit.save(traced, save_path)
@@ -222,22 +232,29 @@ class ParallelLayer(nn.Module):
         block = self._parallel_blocks[block_name]
         block_config = self.block_configs[block_name]
         input_component_names = block_config["component_names"]
-        input_for_block = get_subobs_by_components(
-            flat_input,
-            input_component_names,
-            self.input_segments,
-            temporal=module_is_from_type(block, TransformerHeadModel),
-        )
-        if module_is_from_type(block, Conv2dHeadModel):
-            assert len(input_component_names) == 1, "Conv2dHeadModel only accept one obs component for now"
-            input_for_block = input_for_block.reshape(-1, *self.input_segments[input_component_names[0]])
-        if module_is_from_type(block, TransformerHeadModel):
+        input_names = ["input"]
+        if module_is_from_type(block, CrossAttnFuseHeadModel):
+            # two-input block: the exported graph keeps the (image, info) signature,
+            # so the deployment side must feed the proprio query as a second input.
+            input_for_block = self._cross_attn_block_inputs(flat_input, input_component_names, block)
+            input_names = ["image", "info"]
+        else:
+            input_for_block = get_subobs_by_components(
+                flat_input,
+                input_component_names,
+                self.input_segments,
+                temporal=module_is_from_type(block, TransformerHeadModel),
+            )
+            if module_is_from_type(block, Conv2dHeadModel):
+                assert len(input_component_names) == 1, "Conv2dHeadModel only accept one obs component for now"
+                input_for_block = input_for_block.reshape(-1, *self.input_segments[input_component_names[0]])
+        if module_is_from_type(block, (TransformerHeadModel, CrossAttnFuseHeadModel)):
             torch.backends.cuda.enable_mem_efficient_sdp(False)  # Disable Memory-Efficient Attention
         exported_program = torch.onnx.export(
             block,
             input_for_block,
             "/tmp/parallel_layer.onnx",  # This file does not contain the model weight, we call the save later to save the onnx with model weight.
-            input_names=["input"],
+            input_names=input_names,
             output_names=["output"],
             dynamo=True,
             opset_version=15,  # on pytorch 2.4.0 for transformer encoder. Not sure for others.
