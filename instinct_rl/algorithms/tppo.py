@@ -282,47 +282,42 @@ class TPPO(PPO):
 
         return dist_loss
 
+    def resample_hidden_states(self, minibatch):
+        """Hidden-state domain randomization: with prob ``hidden_state_resample_prob``
+        per trajectory, replace the stored initial RNN hidden states of the BPTT
+        window with uniform noise in [-1, 1] (GRU/LSTM hidden states always lie
+        in that range).
+
+        ``minibatch.hidden_states`` is an ``ActorCriticHiddenState`` namedarraytuple
+        (whose ``[i]`` indexes into the contained tensors, NOT the fields), possibly
+        nesting ``LstmHiddenState``. The structure is rebuilt with the same types so
+        downstream field access (``.actor`` / ``.critic``) keeps working; actor and
+        critic hidden states share the same per-trajectory mask.
+        """
+        hidden_states = getattr(minibatch, "hidden_states", None)
+        if hidden_states is None:
+            return minibatch
+
+        def first_tensor(x):
+            while not torch.is_tensor(x):
+                x = next(iter(x))  # namedarraytuple/tuple iteration yields fields
+            return x
+
+        # hidden states are (num_layers, n_trajs, hidden_size): mask per trajectory
+        n_trajs = first_tensor(hidden_states).shape[1]
+        resample_mask = torch.rand(n_trajs, device=self.device) < self.hidden_state_resample_prob
+
+        def resample(x):
+            if torch.is_tensor(x):
+                return torch.where(resample_mask.unsqueeze(-1), torch.rand_like(x) * 2 - 1, x)
+            fields = [resample(v) for v in x]
+            return tuple(fields) if type(x) is tuple else type(x)(*fields)
+
+        return minibatch._replace(hidden_states=resample(hidden_states))
+
     def compute_losses(self, minibatch):
-        if self.hidden_state_resample_prob > 0.0 and minibatch.hidden_states is not None:
-            # assuming the hidden states are from LSTM or GRU, which are always betwein -1 and 1
-            hidden_state_example = (
-                minibatch.hidden_states[0][0]
-                if isinstance(minibatch.hidden_states[0], tuple)
-                else minibatch.hidden_states[0]
-            )
-            resample_mask = (
-                torch.rand(hidden_state_example.shape[1], device=self.device) < self.hidden_state_resample_prob
-            )
-            # for each hidden state, resample from -1 to 1
-            if isinstance(minibatch.hidden_states[0], tuple):
-                # for LSTM not tested
-                # iterate through actor and critic hidden state
-                minibatch = minibatch._replace(
-                    hidden_states=tuple(
-                        tuple(
-                            torch.where(
-                                resample_mask.unsqueeze(0).unsqueeze(-1),
-                                torch.rand_like(minibatch.hidden_states[i][j], device=self.device) * 2 - 1,
-                                minibatch.hidden_states[i][j],
-                            )
-                            for j in range(len(minibatch.hidden_states[i]))
-                        )
-                        for i in range(len(minibatch.hidden_states))
-                    )
-                )
-            else:
-                # for GRU
-                # iterate through actor and critic hidden state
-                minibatch = minibatch._replace(
-                    hidden_states=tuple(
-                        torch.where(
-                            resample_mask.unsqueeze(-1),
-                            torch.rand_like(minibatch.hidden_states[i], device=self.device) * 2 - 1,
-                            minibatch.hidden_states[i],
-                        )
-                        for i in range(len(minibatch.hidden_states))
-                    )
-                )
+        if self.hidden_state_resample_prob > 0.0:
+            minibatch = self.resample_hidden_states(minibatch)
 
         if self.using_ppo:
             losses, inter_vars, stats = super().compute_losses(minibatch)
