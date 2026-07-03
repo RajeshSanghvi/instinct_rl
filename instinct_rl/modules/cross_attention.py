@@ -7,9 +7,11 @@ Fusion, Hao et al. 2026) and the SRU memory ``CrossAttentionFuseModule``.
 Pipeline (per frame)::
 
     depth ─Conv tokenizer─► N image tokens ─(+pos)─► self-attn x L ─► LN ─┐ (K, V)
-    proprio ─info MLP─► 1 query token ─► LN ───────────────────────────────┤ (Q)
+    proprio ─info MLP─► e_p ─► LN ─────────────────────────────────────────┤ (Q)
                                                                             ▼
-                           CrossAttn(Q=proprio, K=V=image) ─► 1 fused token ─► out_proj
+                          CrossAttn(Q=proprio, K=V=image) ─► attended token ē_d
+                                                                            ▼
+              (use_grf) GRF([e_p ; ē_d]) gated residual fusion ─► out_proj
 
 Following CReF (Eq. 8-9), both attention inputs are LayerNorm-ed: the token
 stream gets a final LN before serving as K/V (with ``num_self_attn_layers=0``
@@ -17,10 +19,13 @@ this is exactly the paper's ``E_d = LN(Z_t)``), and the proprioceptive query
 token is normalized before projection (``Q = LN(e_p) W_q``, where ``W_q`` is
 the in-projection inside ``nn.MultiheadAttention``).
 
-Unlike the full CReF block, this variant drops the Gated Residual Fusion and the
-highway output gate: the fused depth feature is simply concatenated with the raw
-proprioception downstream (handled by ``ParallelLayer``) and fed to the existing
-recurrent memory.
+With ``use_grf=True`` the block also applies CReF's Gated Residual Fusion
+(Eq. 12-14) on the concatenation of the proprio token ``e_p`` and the attended
+depth feature ``ē_d``: an input-conditioned per-channel gate decides how much
+of the depth-derived correction is injected on top of the identity path, so the
+policy can attenuate unreliable depth evidence instead of being poisoned by it.
+The highway output gate around the recurrent memory (Eq. 15-16) lives in
+``Memory`` (actor_critic_recurrent.py), not here.
 """
 
 import torch
@@ -53,6 +58,30 @@ class _PreNormSelfAttnLayer(nn.Module):
         return x
 
 
+class _GatedResidualFusion(nn.Module):
+    """CReF Gated Residual Fusion (Eq. 12-14).
+
+    x_tilde = ELU(W1 LN(x) + b1); [c ; g] = W2 x_tilde + b2; f = x + c * sigmoid(g)
+
+    The identity path preserves the input regardless of the gate; the
+    per-channel, input-conditioned gate scales the content update so
+    unreliable (e.g. OOD) depth evidence can be attenuated.
+    """
+
+    def __init__(self, dim: int, nonlinearity) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.proj = nn.Linear(dim, dim)
+        self.act = nonlinearity()
+        # one linear producing both the content c and the gate logits g
+        self.content_gate = nn.Linear(dim, 2 * dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.act(self.proj(self.norm(x)))
+        c, g = self.content_gate(h).chunk(2, dim=-1)
+        return x + c * torch.sigmoid(g)
+
+
 class CrossAttnFuseHeadModel(nn.Module):
     """Conv tokenizer + self-attention + proprioception-queried cross-attention.
 
@@ -74,6 +103,10 @@ class CrossAttnFuseHeadModel(nn.Module):
         info_hidden_sizes: Hidden layer widths of the proprioceptive query MLP
             (info -> query token). The output is always ``d_model``. Defaults to
             ``[d_model * ffn_expansion]`` (one hidden layer).
+        use_grf: Whether to apply CReF's Gated Residual Fusion (Eq. 12-14) on
+            ``[e_p ; ē_d]`` (dim ``2 * d_model``) before the output projection.
+            ``False`` keeps the minimal variant: the attended token alone goes
+            to ``out_proj``.
         nonlinearity: Activation module (or its name in ``torch.nn``).
         use_maxpool: Whether the conv tokenizer uses max-pooling for downsampling.
     """
@@ -91,6 +124,7 @@ class CrossAttnFuseHeadModel(nn.Module):
         num_self_attn_layers: int = 1,
         ffn_expansion: int = 2,
         info_hidden_sizes=None,
+        use_grf: bool = False,
         nonlinearity=nn.ELU,
         use_maxpool: bool = False,
     ) -> None:
@@ -158,7 +192,11 @@ class CrossAttnFuseHeadModel(nn.Module):
         # cross-attention sub-layer (proprio query, image key/value)
         self.cross_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
 
-        self.out_proj = nn.Identity() if output_size == d_model else nn.Linear(d_model, output_size)
+        # gated residual fusion over [e_p ; attended depth token] (CReF Eq. 12-14)
+        fuse_dim = 2 * d_model if use_grf else d_model
+        self.grf = _GatedResidualFusion(fuse_dim, nonlinearity) if use_grf else None
+
+        self.out_proj = nn.Identity() if output_size == fuse_dim else nn.Linear(fuse_dim, output_size)
         self._output_size = output_size
 
     @property
@@ -184,7 +222,14 @@ class CrossAttnFuseHeadModel(nn.Module):
         kv = self.token_norm(x)
 
         # proprio as query, image tokens as key/value
-        q = self.query_norm(self.info_proj(info)).unsqueeze(1)  # (N, 1, d_model)
+        e_p = self.info_proj(info)  # (N, d_model) proprio token
+        q = self.query_norm(e_p).unsqueeze(1)  # (N, 1, d_model)
         ca, _ = self.cross_attn(q, kv, kv, need_weights=False)  # (N, 1, d_model)
+        ca = ca.squeeze(1)
 
-        return self.out_proj(ca.squeeze(1))  # (N, output_size)
+        if self.grf is not None:
+            fused = self.grf(torch.cat([e_p, ca], dim=-1))  # (N, 2 * d_model)
+        else:
+            fused = ca
+
+        return self.out_proj(fused)  # (N, output_size)

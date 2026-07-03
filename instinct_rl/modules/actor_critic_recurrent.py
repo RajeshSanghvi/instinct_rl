@@ -59,6 +59,7 @@ class ActorCriticRecurrent(ActorCritic):
         rnn_type="lstm",
         rnn_hidden_size=256,
         rnn_num_layers=1,
+        rnn_highway=False,
         multireward_multirnn=False,
         init_noise_std=1.0,
         num_rewards=1,
@@ -87,18 +88,25 @@ class ActorCriticRecurrent(ActorCritic):
 
         num_actor_obs = get_subobs_size(obs_format["policy"])
         num_critic_obs = get_subobs_size(obs_format.get("critic", obs_format["policy"]))
-        self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_size)
+        self.memory_a = Memory(
+            num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_size, highway=rnn_highway
+        )
         if num_rewards > 1 and multireward_multirnn:
             self.memory_c = MemoryList(
                 num_critic_obs,
                 type=rnn_type,
                 num_layers=rnn_num_layers,
                 hidden_size=rnn_hidden_size,
+                highway=rnn_highway,
                 num_memories=num_rewards,
             )
         else:
             self.memory_c = Memory(
-                num_critic_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_size
+                num_critic_obs,
+                type=rnn_type,
+                num_layers=rnn_num_layers,
+                hidden_size=rnn_hidden_size,
+                highway=rnn_highway,
             )
 
         print(f"Actor RNN: {self.memory_a}")
@@ -126,7 +134,7 @@ class ActorCriticRecurrent(ActorCritic):
     def export_as_onnx(self, observations, filedir):
         assert isinstance(self.memory_a.rnn, torch.nn.GRU), "ONNX export only supports GRU for now."
 
-        model = OnnxMemoryActor(self.memory_a.rnn, self.actor)
+        model = OnnxMemoryActor(self.memory_a, self.actor)
         model.eval()
         hidden_states = torch.zeros(self.memory_a.rnn.num_layers, 1, self.memory_a.rnn.hidden_size).to(
             observations.device
@@ -146,12 +154,30 @@ LstmHiddenState = namedarraytuple("LstmHiddenState", ["hidden", "cell"])
 
 
 class Memory(torch.nn.Module):
-    def __init__(self, input_size, type="lstm", num_layers=1, hidden_size=256):
+    def __init__(self, input_size, type="lstm", num_layers=1, hidden_size=256, highway=False):
         super().__init__()
         # RNN currently support only GRU and LSTM
         rnn_cls = nn.GRU if type.lower() == "gru" else nn.LSTM
         self.rnn = rnn_cls(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers)
+        # highway output gate (CReF Eq. 15-16): a feedforward bypass around the
+        # RNN. The input f_t is projected to the hidden size (mirrored variant of
+        # the paper's W_h, keeping the output dim = hidden_size so downstream
+        # heads are unchanged) and blended per-channel with the recurrent output:
+        #   beta = sigmoid(W_b [h_t ; W_f f_t]);  y = beta * h_t + (1 - beta) * W_f f_t
+        # so the policy can down-weight a drifting/corrupted hidden state and act
+        # on the current-frame features instead.
+        if highway:
+            self.highway_proj = nn.Linear(input_size, hidden_size)
+            self.highway_gate = nn.Linear(2 * hidden_size, hidden_size)
+        else:
+            self.highway_proj = None
+            self.highway_gate = None
         self.hidden_states = None
+
+    def _highway_fuse(self, out, input):
+        f = self.highway_proj(input)
+        beta = torch.sigmoid(self.highway_gate(torch.cat([out, f], dim=-1)))
+        return beta * out + (1.0 - beta) * f
 
     def forward(self, input, masks=None, hidden_states=None):
         batch_mode = hidden_states is not None
@@ -160,6 +186,9 @@ class Memory(torch.nn.Module):
             if is_namedarraytuple(hidden_states):
                 hidden_states = tuple(hidden_states)
             out, _ = self.rnn(input, hidden_states)
+            if self.highway_proj is not None:
+                # element-wise over (T, N, ·): padded steps are dropped below
+                out = self._highway_fuse(out, input)
             if not masks is None:
                 # in this case, user can choose whether to unpad the output or not
                 out = unpad_trajectories(out, masks)
@@ -171,6 +200,8 @@ class Memory(torch.nn.Module):
             if isinstance(self.hidden_states, tuple):
                 self.hidden_states = LstmHiddenState(*self.hidden_states)
             out = out.squeeze(0)  # remove the time dimension
+            if self.highway_proj is not None:
+                out = self._highway_fuse(out, input)
         return out
 
     @staticmethod
@@ -208,8 +239,8 @@ class Memory(torch.nn.Module):
 class MemoryList(torch.nn.ModuleList):
     """A list of memory modules, which packs the hidden states of all memories."""
 
-    def __init__(self, input_size, type="lstm", num_layers=1, hidden_size=256, num_memories=1):
-        super().__init__([Memory(input_size, type, num_layers, hidden_size) for _ in range(num_memories)])
+    def __init__(self, input_size, type="lstm", num_layers=1, hidden_size=256, highway=False, num_memories=1):
+        super().__init__([Memory(input_size, type, num_layers, hidden_size, highway) for _ in range(num_memories)])
         self._num_layers = num_layers
         self.hidden_states = None
 
@@ -250,12 +281,15 @@ class MemoryList(torch.nn.ModuleList):
 
 
 class OnnxMemoryActor(torch.nn.Module):
-    def __init__(self, rnn: torch.nn.GRU, mlp):
+    def __init__(self, memory: Memory, mlp):
         super().__init__()
-        self.rnn = rnn
+        self.memory = memory
         self.mlp = mlp
 
     def forward(self, input: torch.Tensor, hidden_states: torch.Tensor):
-        out, hidden_states = self.rnn(input.unsqueeze(0), hidden_states)
-        out = self.mlp(out.squeeze(0))
+        out, hidden_states = self.memory.rnn(input.unsqueeze(0), hidden_states)
+        out = out.squeeze(0)
+        if self.memory.highway_proj is not None:
+            out = self.memory._highway_fuse(out, input)
+        out = self.mlp(out)
         return out, hidden_states
