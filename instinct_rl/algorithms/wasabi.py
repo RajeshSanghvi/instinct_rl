@@ -203,7 +203,7 @@ class WasabiAlgoMixin:
         losses["discriminator_loss"] = discriminator_loss
         losses["discriminator_gradient_penalty"] = discriminator_gradient_penalty
         losses["discriminator_weight_decay"] = weight_decay_loss
-        losses["logit_weight_decay"] = logit_weight_decay_loss
+        losses["discriminator_logit_weight_decay"] = logit_weight_decay_loss
         stats["discriminator_actor"] = actor_d.mean()
         stats["discriminator_reference"] = reference_d.mean()
 
