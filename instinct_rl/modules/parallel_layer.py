@@ -208,14 +208,13 @@ class ParallelLayer(nn.Module):
             input_for_block = input_for_block.reshape(-1, *self.input_segments[input_component_names[0]])
         if module_is_from_type(block, TransformerHeadModel):
             torch.backends.cuda.enable_mem_efficient_sdp(False)  # Disable Memory-Efficient Attention
-        exported_program = torch.onnx.export(
+        torch.onnx.export(
             block,
             input_for_block,
-            "/tmp/parallel_layer.onnx",  # This file does not contain the model weight, we call the save later to save the onnx with model weight.
+            os.path.join(filedir, f"{self._sequential_idx}-{block_name}.onnx"),
             input_names=["input"],
             output_names=["output"],
-            dynamo=True,
+            dynamo=False,
             opset_version=15,  # on pytorch 2.4.0 for transformer encoder. Not sure for others.
         )
-        exported_program.save(os.path.join(filedir, f"{self._sequential_idx}-{block_name}.onnx"))
         print(f"Exported {block_name} to {os.path.join(filedir, f'{self._sequential_idx}-{block_name}.onnx')}")

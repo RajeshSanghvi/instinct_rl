@@ -122,3 +122,55 @@ class Discriminator(nn.Module):
         if isinstance(model, nn.Sequential):
             model = model[0]
         return model.model[-1].weight
+
+
+class MultiDiscriminator(nn.Module):
+    """A collection of `num_styles` independent discriminators, one per style.
+
+    Each style corresponds to a sub-population of the policy roll-out (in the parkour setting,
+    a terrain group such as flat vs. stairs). Discriminator ``i`` is trained only on the
+    transitions whose active style is ``i`` and scores only those transitions for the style
+    reward -- matching the Multi-AMP formulation ``{D_i, B_i^pi, M_i}`` (Vollenweider et al.).
+
+    Styles listed in ``data_free_styles`` get no discriminator (a parameter-less placeholder is
+    stored so indices stay aligned); the algorithm assigns them a zero style reward and never
+    trains them (Multi-AMP data-free skills).
+    """
+
+    is_recurrent = False
+
+    def __init__(
+        self,
+        discriminator_class: type,
+        num_styles: int,
+        input_segment: dict[str, tuple],
+        data_free_styles=(),
+        **discriminator_kwargs,
+    ):
+        """
+        Args:
+            discriminator_class: the class used to build each per-style discriminator (e.g. `Discriminator`).
+            num_styles: number of styles, i.e. number of discriminators.
+            input_segment: the input segment passed to every discriminator.
+            data_free_styles: indices of styles that have no motion data and thus no discriminator.
+            discriminator_kwargs: forwarded to every discriminator constructor.
+        """
+        super().__init__()
+        self.num_styles = num_styles
+        self.data_free_styles = set(int(i) for i in data_free_styles)
+
+        discriminators = []
+        for i in range(num_styles):
+            if i in self.data_free_styles:
+                # Placeholder keeps ModuleList indices aligned with style ids; it has no
+                # parameters and is never called (guarded by `has_data`).
+                discriminators.append(nn.Module())
+            else:
+                discriminators.append(discriminator_class(input_segment=input_segment, **discriminator_kwargs))
+        self.discriminators = nn.ModuleList(discriminators)
+
+        print(f"MultiDiscriminator with {num_styles} styles (data-free: {sorted(self.data_free_styles)})")
+
+    def has_data(self, style: int) -> bool:
+        """Whether `style` has a trainable discriminator (i.e. is not a data-free style)."""
+        return int(style) not in self.data_free_styles

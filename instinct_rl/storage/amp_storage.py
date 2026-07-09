@@ -13,6 +13,7 @@ class AmpStorage:
             self.actor_states = None
             self.reference_states = None
             self.hidden_states = None
+            self.style_ids = None
             self.dones = None
 
         def clear(self):
@@ -46,6 +47,9 @@ class AmpStorage:
             num_transitions_per_env, num_envs, *reference_state_shape, device=self.device
         )
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        # active style index (e.g. terrain group) for every transition, used to route each
+        # transition to its discriminator. Defaults to 0 so single-style (vanilla AMP) is unchanged.
+        self.style_ids = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device, dtype=torch.long)
 
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
@@ -61,6 +65,8 @@ class AmpStorage:
         self.actor_states[self.step].copy_(transition.actor_states)
         self.reference_states[self.step].copy_(transition.reference_states)
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        if transition.style_ids is not None:
+            self.style_ids[self.step].copy_(transition.style_ids.view(-1, 1))
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
 
@@ -77,7 +83,7 @@ class AmpStorage:
 
         # initialize if needed
         if self.saved_hidden_states is None:
-            self.saved_hidden_states = buffer_from_example(hidden_states, self.observations.shape[0])
+            self.saved_hidden_states = buffer_from_example(hidden_states, self.num_transitions_per_env)
         # copy the states
         self.saved_hidden_states[self.step] = hidden_states
 
@@ -99,6 +105,32 @@ class AmpStorage:
                 B_idx = B_indices[start:end]
 
                 yield self.get_minibatch_from_selection(T_idx, B_idx)
+
+    def style_mini_batch_generator(self, style, num_mini_batches, num_epochs=8):
+        """Yield minibatches built only from transitions whose active style equals `style`.
+
+        Mirrors `mini_batch_generator` but restricts the sampling pool to a single style, so each
+        discriminator is trained on its own roll-out buffer B_i^pi (Multi-AMP). Yields nothing if
+        the style has too few transitions to fill one minibatch.
+        """
+        # linear index over the (T, num_envs) grid, decoded the same way as mini_batch_generator.
+        style_flat = self.style_ids.reshape(-1)  # (T * num_envs,)
+        selected = torch.nonzero(style_flat == style, as_tuple=False).squeeze(-1)
+        num_selected = selected.numel()
+        mini_batch_size = num_selected // num_mini_batches
+        if mini_batch_size == 0:
+            return
+
+        perm = torch.randperm(num_selected, requires_grad=False, device=self.device)
+        selected = selected[perm][: num_mini_batches * mini_batch_size]
+        T_indices = (selected // self.num_envs).to(torch.long)
+        B_indices = (selected % self.num_envs).to(torch.long)
+
+        for epoch in range(num_epochs):
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                end = (i + 1) * mini_batch_size
+                yield self.get_minibatch_from_selection(T_indices[start:end], B_indices[start:end])
 
     # for RNNs only
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
