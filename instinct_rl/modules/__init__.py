@@ -12,7 +12,7 @@ from .all_mixer import (
     MoEActorCriticRecurrent,
 )
 from .cross_attention import CrossAttnFuseHeadModel
-from .discriminator import Discriminator
+from .discriminator import Discriminator, MultiDiscriminator
 from .encoder_actor_critic import EncoderActorCritic, EncoderActorCriticRecurrent
 from .moe_actor_critic import MoEActorCritic
 from .normalizer import (
@@ -72,6 +72,8 @@ def build_normalizer(
     - If you want to use not-supported normalizer for quick test, you may set normalizer_class_name
         to a module direction, e.g. `instinct_rl.modules:EmpiricalNormalization`
     """
+    if normalizer_kwargs is None:
+        normalizer_kwargs = {}
     if normalizer_class_name is not None:
         if normalizer_class_name == "EmpiricalNormalization":
             normalizer = EmpiricalNormalization(shape=input_shape, **normalizer_kwargs)

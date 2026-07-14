@@ -23,6 +23,9 @@ class WasabiAlgoMixin:
         *args,
         actor_state_key="amp_policy",  # the key of getting policy's state sequence
         reference_state_key="amp_reference",  # the key of getting expert's reference sequence
+        num_styles=1,  # number of discriminators / styles. 1 -> vanilla single-discriminator AMP.
+        style_key="amp_style",  # obs key giving each env's active style index (e.g. terrain group)
+        data_free_styles=(),  # style indices without motion data (zero style reward, no discriminator)
         discriminator_class_name="Discriminator",
         discriminator_kwargs={},
         discriminator_optimizer_class_name="AdamW",
@@ -45,6 +48,9 @@ class WasabiAlgoMixin:
         super().__init__(*args, **kwargs)
         self.actor_state_key = actor_state_key
         self.reference_state_key = reference_state_key
+        self.num_styles = num_styles
+        self.style_key = style_key
+        self.data_free_styles = data_free_styles
         self.discriminator_class_name = discriminator_class_name
         self.discriminator_kwargs = discriminator_kwargs
         self.discriminator_optimizer_class_name = discriminator_optimizer_class_name
@@ -69,8 +75,12 @@ class WasabiAlgoMixin:
             )
         else:
             DiscriminatorClass = getattr(instinct_modules, self.discriminator_class_name)
-        self.discriminator = DiscriminatorClass(
+        # One discriminator per style (num_styles == 1 reproduces vanilla single-discriminator AMP).
+        self.discriminator = instinct_modules.MultiDiscriminator(
+            discriminator_class=DiscriminatorClass,
+            num_styles=self.num_styles,
             input_segment=obs_format[self.actor_state_key],
+            data_free_styles=self.data_free_styles,
             **self.discriminator_kwargs,
         ).to(self.device)
         if not "lr" in self.discriminator_optimizer_kwargs:
@@ -99,6 +109,7 @@ class WasabiAlgoMixin:
         reference_state = infos["observations"][self.reference_state_key]
         self.amp_transition.actor_states = actor_state
         self.amp_transition.reference_states = reference_state
+        self.amp_transition.style_ids = self._get_style_ids(infos["observations"], actor_state.shape[0])
         if self.discriminator.is_recurrent:
             self.amp_transition.hidden_states = self.discriminator.get_hidden_states()
         self.amp_transition.dones = dones
@@ -108,62 +119,132 @@ class WasabiAlgoMixin:
         # do not call compute_auxilary_reward here, because it is called in the baseclass function
         super().process_env_step(rewards, dones, infos, next_obs, next_critic_obs)
 
+    def _get_style_ids(self, obs_pack: dict[str, torch.Tensor], num_envs: int) -> torch.Tensor:
+        """Per-env active style index (num_envs, 1) long.
+
+        When `num_styles == 1` a missing `style_key` falls back to all-zeros so vanilla AMP configs
+        keep working. With multiple styles a missing key is a hard error -- silently defaulting to
+        style 0 would leave every other discriminator untrained while training looks healthy.
+        """
+        style_ids = obs_pack.get(self.style_key)
+        if style_ids is None:
+            if self.num_styles == 1:
+                return torch.zeros(num_envs, 1, device=self.device, dtype=torch.long)
+            raise KeyError(
+                f"num_styles={self.num_styles} but style key '{self.style_key}' is missing from the "
+                "observations. Provide a per-env style observation (e.g. amp_terrain_style) or set "
+                "num_styles=1."
+            )
+        style_ids = style_ids.view(-1, 1).to(device=self.device, dtype=torch.long)
+        if style_ids.shape[0] != num_envs:
+            raise ValueError(f"style ids batch size {style_ids.shape[0]} != num_envs {num_envs}")
+        # Validate whenever the key is present, regardless of num_styles: an out-of-range id (e.g.
+        # amp_style=1 while num_styles=1) would otherwise silently match no discriminator, giving
+        # zero reward and no discriminator update with no error.
+        if (style_ids < 0).any() or (style_ids >= self.num_styles).any():
+            raise ValueError(f"style id out of range [0, {self.num_styles}): got {style_ids.unique().tolist()}")
+        return style_ids
+
+    def _discriminator_reward(self, disc: torch.Tensor) -> torch.Tensor:
+        """Map a raw discriminator output to a (positive) style reward."""
+        if self.discriminator_reward_type == "log":
+            # Typically discimination is the output of a direct linear layer. This is the default AMP implementation.
+            return -torch.log(1 - torch.clamp(torch.sigmoid(disc), 1e-6, 1 - 1e-6))
+        elif self.discriminator_reward_type == "quad":
+            # Copied from WASABI, not sure if this is correct. This assumes disc is the output of a direct linear layer.
+            return torch.clamp(1 - (1 / 4) * torch.square(disc - 1), min=0)
+        elif self.discriminator_reward_type == "wasserstein":
+            # Copied from WASABI, not sure if this is correct. This assumes disc is the output of a direct linear layer.
+            return disc
+        raise NotImplementedError(f"discriminator reward type {self.discriminator_reward_type} not implemented")
+
     @torch.no_grad()
     def compute_auxiliary_reward(self, obs_pack: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         super_auxilary_reward = super().compute_auxiliary_reward(obs_pack)
         actor_state = obs_pack[self.actor_state_key]
-        disc = self.discriminator(actor_state).detach()
-        if self.discriminator_reward_type == "log":
-            # Typically discimination is the output of a direct linear layer. This is the default AMP implementation.
-            reward = -torch.log(1 - torch.clamp(torch.sigmoid(disc), 1e-6, 1 - 1e-6))
-        elif self.discriminator_reward_type == "quad":
-            # Copied from WASABI, not sure if this is correct. This assumes disc is the output of a direct linear layer.
-            reward = torch.clamp(1 - (1 / 4) * torch.square(disc - 1), min=0)
-        elif self.discriminator_reward_type == "wasserstein":
-            # Copied from WASABI, not sure if this is correct. This assumes disc is the output of a direct linear layer.
-            reward = disc
+        num_envs = actor_state.shape[0]
+        style_ids = self._get_style_ids(obs_pack, num_envs).view(-1)
+
+        # Each env is scored only by the discriminator of its active style; data-free styles get 0.
+        reward = torch.zeros(num_envs, 1, device=self.device)
+        for style in range(self.num_styles):
+            if not self.discriminator.has_data(style):
+                continue
+            mask = style_ids == style
+            if mask.any():
+                disc = self.discriminator.discriminators[style](actor_state[mask]).detach()
+                reward[mask] = self._discriminator_reward(disc)
         super_auxilary_reward["discriminator_reward"] = reward
         return super_auxilary_reward
+
+    def _styles_runnable_on_all_ranks(self, active_styles):
+        """Filter `active_styles` to those with enough samples to form minibatches on every rank.
+
+        `style_mini_batch_generator` yields nothing when a style has fewer than `num_mini_batches`
+        transitions; running it on some ranks but not others would desync the gradient all-reduce.
+        """
+        style_flat = self.amp_storage.style_ids.reshape(-1)
+        runnable = torch.tensor(
+            [int((style_flat == s).sum().item()) >= self.num_mini_batches for s in active_styles],
+            device=self.device,
+            dtype=torch.float,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(runnable, op=dist.ReduceOp.MIN)
+        result = [s for s, ok in zip(active_styles, runnable.tolist()) if ok > 0.5]
+        dropped = [s for s in active_styles if s not in result]
+        if dropped:
+            print(f"[Warning] Styles {dropped} have too few samples this iteration and are skipped.")
+        return result
 
     def update(self, *args, **kwargs):
         mean_losses, average_stats = super().update(*args, **kwargs)
 
-        # iterate over the discriminator optimization steps
         if self.discriminator.is_recurrent:
-            # Leaving possibility for recurrent discriminator, but this is not well designed yet.
-            amp_generator = self.amp_storage.recurrent_mini_batch_generator(
-                self.num_mini_batches, self.num_learning_epochs
+            raise NotImplementedError("Recurrent multi-discriminator update is not supported yet.")
+
+        # Each style's discriminator is updated only on its own roll-out buffer (Multi-AMP).
+        active_styles = [s for s in range(self.num_styles) if self.discriminator.has_data(s)]
+        # A style yields a fixed number of minibatches only if it has enough samples. Under DDP every
+        # rank must run the same styles, otherwise the per-step grad all-reduce collectives desync and
+        # hang. So drop any style that lacks samples on *any* rank (synchronized via all-reduce MIN).
+        active_styles = self._styles_runnable_on_all_ranks(active_styles)
+        updates_per_style = self.num_learning_epochs * self.num_mini_batches
+        num_updates = max(len(active_styles) * updates_per_style, 1)
+        for style in active_styles:
+            amp_generator = self.amp_storage.style_mini_batch_generator(
+                style, self.num_mini_batches, self.num_learning_epochs
             )
-        else:
-            amp_generator = self.amp_storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-        num_updates = self.num_learning_epochs * self.num_mini_batches
-        for amp_minibatch in amp_generator:
-            losses, _, stats = self.compute_amp_losses(amp_minibatch)
+            for amp_minibatch in amp_generator:
+                losses, _, stats = self.compute_amp_losses(amp_minibatch, style)
 
-            loss = 0.0
-            for k, v in losses.items():
-                loss += getattr(self, k + "_coef", 1.0) * v
-                mean_losses[k] = mean_losses[k] + v.detach() / num_updates
-            mean_losses["amp_total_loss"] = mean_losses["amp_total_loss"] + loss.detach() / num_updates
-            for k, v in stats.items():
-                average_stats[k] = average_stats[k] + v.detach() / num_updates
+                loss = 0.0
+                for k, v in losses.items():
+                    loss += getattr(self, k + "_coef", 1.0) * v
+                    mean_losses[k] = mean_losses[k] + v.detach() / num_updates
+                mean_losses["amp_total_loss"] = mean_losses["amp_total_loss"] + loss.detach() / num_updates
+                # stats are per-style keyed, so average them over that style's own update count.
+                for k, v in stats.items():
+                    average_stats[k] = average_stats[k] + v.detach() / updates_per_style
 
-            self.wasabi_gradient_step(loss, average_stats)
+                self.wasabi_gradient_step(loss, average_stats)
 
         self.amp_storage.clear()
+        self._sync_discriminator_buffers()
 
         return mean_losses, average_stats
 
-    def compute_amp_losses(self, amp_minibatch: AmpStorage.MiniBatch):
+    def compute_amp_losses(self, amp_minibatch: AmpStorage.MiniBatch, style: int = 0):
         losses, stats, inter_vars = dict(), dict(), dict()
+        discriminator = self.discriminator.discriminators[style]
 
         # discriminator must compute the discriminator during act()
         # TODO: run recurrent discriminator.
-        actor_d = self.discriminator(
+        actor_d = discriminator(
             amp_minibatch.actor_states,
             masks=amp_minibatch.masks,
         )
-        reference_d = self.discriminator(
+        reference_d = discriminator(
             amp_minibatch.reference_states,
             masks=amp_minibatch.masks,
         )
@@ -183,36 +264,39 @@ class WasabiAlgoMixin:
         discriminator_loss = (actor_d_loss + reference_d_loss) * 0.5
         if self.discriminator_gradient_penalty_coef > 0:
             if self.discriminator_backbone_gradient_only:
-                discriminator_gradient_penalty = self.compute_discriminator_backbone_gradient(amp_minibatch)
+                discriminator_gradient_penalty = self.compute_discriminator_backbone_gradient(amp_minibatch, style)
             else:
-                discriminator_gradient_penalty = self.compute_discriminator_gradient(amp_minibatch)
+                discriminator_gradient_penalty = self.compute_discriminator_gradient(amp_minibatch, style)
         else:
             discriminator_gradient_penalty = torch.zeros(1, device=self.device)[0]
 
         # compute weight decay loss
         weight_decay_loss = torch.zeros(1, device=self.device)[0]
-        for param in self.discriminator.parameters():
+        for param in discriminator.parameters():
             weight_decay_loss += torch.sum(param**2)
 
         # Following ProtoMotions, compute the weight decay loss for the last layer of the discriminator.
         logit_weight_decay_loss = torch.zeros(1, device=self.device)[0]
         if self.discriminator_logit_weight_decay_coef > 0:
-            logit_weight = self.discriminator.logit_layer_weights()
+            logit_weight = discriminator.logit_layer_weights()
             logit_weight_decay_loss = torch.sum(logit_weight**2)
 
         losses["discriminator_loss"] = discriminator_loss
         losses["discriminator_gradient_penalty"] = discriminator_gradient_penalty
         losses["discriminator_weight_decay"] = weight_decay_loss
-        losses["logit_weight_decay"] = logit_weight_decay_loss
-        stats["discriminator_actor"] = actor_d.mean()
-        stats["discriminator_reference"] = reference_d.mean()
+        # Key must be "<attr-prefix>" of `discriminator_logit_weight_decay_coef`: `update()` looks up
+        # the coefficient via getattr(self, key + "_coef", 1.0). A mismatched key silently applies 1.0.
+        losses["discriminator_logit_weight_decay"] = logit_weight_decay_loss
+        stats[f"discriminator_actor_{style}"] = actor_d.mean()
+        stats[f"discriminator_reference_{style}"] = reference_d.mean()
 
         return losses, inter_vars, stats
 
-    def compute_discriminator_backbone_gradient(self, amp_minibatch: AmpStorage.MiniBatch):
+    def compute_discriminator_backbone_gradient(self, amp_minibatch: AmpStorage.MiniBatch, style: int = 0):
         """Compute the gradient w.r.t discriminator input.
         In WASABI algorithm, it is used as a penalty to satisfy the condition of Lipschitz continuity
         """
+        discriminator = self.discriminator.discriminators[style]
         reference_states = amp_minibatch.reference_states
         reference_states = buffer_func(reference_states, torch.clone)
 
@@ -222,10 +306,10 @@ class WasabiAlgoMixin:
         combined_states = torch.cat([actor_states, reference_states], dim=0)
 
         # NOTE: assumeing discriminator has encoders and backbone_run function
-        latent = self.discriminator.encoders(combined_states).detach()
+        latent = discriminator.encoders(combined_states).detach()
         latent.requires_grad = True
 
-        disc = self.discriminator.backbone_run(latent)
+        disc = discriminator.backbone_run(latent)
 
         ones = torch.ones_like(disc)
         grad = torch.autograd.grad(
@@ -239,10 +323,11 @@ class WasabiAlgoMixin:
 
         return torch.clamp(grad.norm(2, dim=1) - self.discriminator_gradient_torlerance, 0).pow(2).mean()
 
-    def compute_discriminator_gradient(self, amp_minibatch: AmpStorage.MiniBatch):
+    def compute_discriminator_gradient(self, amp_minibatch: AmpStorage.MiniBatch, style: int = 0):
         """Compute the gradient w.r.t expert input.
         In WASABI algorithm, it is used as a penalty to satisfy the condition of Lipschitz continuity
         """
+        discriminator = self.discriminator.discriminators[style]
         reference_states = amp_minibatch.reference_states
         reference_states = buffer_func(reference_states, torch.clone)
         buffer_func(reference_states, setattr, "requires_grad", True)
@@ -253,7 +338,7 @@ class WasabiAlgoMixin:
 
         combined_states = torch.cat([actor_states, reference_states], dim=0)
 
-        disc = self.discriminator(
+        disc = discriminator(
             combined_states,
             masks=amp_minibatch.masks,  # The mask is designed as if the discriminator is recurrent. But it is typically not.
         )
@@ -279,13 +364,63 @@ class WasabiAlgoMixin:
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
         if "discriminator" in state_dict:
-            self.discriminator.load_state_dict(state_dict["discriminator"])
+            disc_sd = state_dict["discriminator"]
+            # Backward compat: a single-discriminator checkpoint has top-level keys (e.g. `model.*`,
+            # `normalizer.*`), whereas MultiDiscriminator nests them under `discriminators.<i>.`.
+            is_legacy_single = not any(k.startswith("discriminators.") for k in disc_sd)
+            if is_legacy_single:
+                if self.num_styles != 1:
+                    print(
+                        "[Warning] Loading a single-discriminator checkpoint into a multi-style model;"
+                        " only style 0 is initialized from it, the others stay randomly initialized."
+                    )
+                self.discriminator.discriminators[0].load_state_dict(disc_sd)
+            else:
+                self.discriminator.load_state_dict(disc_sd)
         else:
             print("[Warning] The discriminator state_dict is not found in the checkpoint")
         if "discriminator_optimizer" in state_dict:
-            self.discriminator_optimizer.load_state_dict(state_dict["discriminator_optimizer"])
+            try:
+                self.discriminator_optimizer.load_state_dict(state_dict["discriminator_optimizer"])
+            except (ValueError, KeyError) as e:
+                # Param groups differ (e.g. legacy single-disc ckpt loaded into multi-style); skip
+                # rather than crash so the discriminator weights still resume.
+                print(f"[Warning] Could not load discriminator optimizer state ({e}); starting fresh.")
         else:
             print("[Warning] The discriminator_optimizer state_dict is not found in the checkpoint")
+
+    def distributed_data_parallel(self):
+        """Broadcast actor-critic AND discriminator params from rank 0 so all ranks start identical.
+
+        The base class only broadcasts the actor-critic; without this the per-style discriminators
+        would diverge across ranks (gradient all-reduce cannot recover differing initial weights).
+        Buffers (e.g. input-normalizer running stats) are broadcast too: they are not parameters,
+        so neither the param broadcast nor the gradient all-reduce covers them.
+        """
+        super().distributed_data_parallel()
+        if dist.is_initialized():
+            for param in self.discriminator.parameters():
+                dist.broadcast(param.data, src=0)
+            for buf in self.discriminator.buffers():
+                dist.broadcast(buf.data, src=0)
+
+    def _sync_discriminator_buffers(self):
+        """Average the discriminators' float buffers (input-normalizer running stats) across ranks.
+
+        Parameters stay in sync through the gradient all-reduce, but each rank updates its
+        normalizer statistics from its own envs' data; left alone they drift apart and the same
+        state would receive a different style reward depending on the rank. All ranks estimate
+        the same underlying distribution with near-equal sample counts, so a plain average is an
+        adequate merge. Integer buffers (sample counts) stay local: they only control the running
+        update rate, and summing them across syncs would inflate the count.
+        """
+        if not dist.is_initialized():
+            return
+        world_size = dist.get_world_size()
+        for buf in self.discriminator.buffers():
+            if buf.dtype.is_floating_point:
+                dist.all_reduce(buf.data, op=dist.ReduceOp.SUM)
+                buf.data /= world_size
 
     def wasabi_gradient_step(self, loss: torch.Tensor, average_stats: dict):
         self.discriminator_optimizer.zero_grad()
