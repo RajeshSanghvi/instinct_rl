@@ -97,20 +97,22 @@ class Discriminator(nn.Module):
                 getattr(nn, self.output_nonlinearity)(),
             )
 
-    def backbone_run(self, x):
+    def backbone_run(self, x, update: bool | None = None):
         if self.normalizer is not None:
-            # The normalizer will determine and update the mean and std of the input data by itself.
-            x = self.normalizer(x)
+            # `update=None` falls back to the normalizer's own training-mode behavior; pass
+            # `update=False` explicitly to score/backprop against frozen statistics.
+            x = self.normalizer(x, update=update)
         return self.model(x)
 
-    def forward(self, x, hidden_states=None, masks=None):
+    def forward(self, x, hidden_states=None, masks=None, update: bool | None = None):
         """NOTE: saving hidden_states and masks for future recurrent models. (Maybe not necessary)"""
         if self.encoders is not None:
             # The encoders will determine and update the input segment by itself.
             x = self.encoders(x)
         if self.normalizer is not None:
-            # The normalizer will determine and update the mean and std of the input data by itself.
-            x = self.normalizer(x)
+            # `update=None` falls back to the normalizer's own training-mode behavior; pass
+            # `update=False` explicitly to score/backprop against frozen statistics.
+            x = self.normalizer(x, update=update)
         return self.model(x)
 
     def logit_layer_weights(self):

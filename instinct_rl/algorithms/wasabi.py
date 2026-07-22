@@ -172,7 +172,8 @@ class WasabiAlgoMixin:
                 continue
             mask = style_ids == style
             if mask.any():
-                disc = self.discriminator.discriminators[style](actor_state[mask]).detach()
+                # Frozen stats: reward inference must not perturb the normalizer running mean/std.
+                disc = self.discriminator.discriminators[style](actor_state[mask], update=False).detach()
                 reward[mask] = self._discriminator_reward(disc)
         super_auxilary_reward["discriminator_reward"] = reward
         return super_auxilary_reward
@@ -197,6 +198,58 @@ class WasabiAlgoMixin:
             print(f"[Warning] Styles {dropped} have too few samples this iteration and are skipped.")
         return result
 
+    @torch.no_grad()
+    def _update_style_normalizers(self, active_styles):
+        """Update each active style's discriminator normalizer once, from a balanced batch of
+        this rollout's actor and reference states for that style.
+
+        `AmpStorage.actor_states`/`reference_states` are 1:1 per transition (same shape, same
+        style_ids), so concatenating them already gives an equal-count actor/reference batch --
+        no separate sampling is needed. This is the only place normalizer statistics change during
+        `update()`; everywhere else `update=False` is passed explicitly.
+
+        Under DDP each rank only sees its own envs' transitions, so a plain local `update()`
+        would fold in a different batch per rank and desync the running stats (see
+        `_ddp_update_normalizer`). `active_styles` is already the DDP-synchronized set from
+        `_styles_runnable_on_all_ranks`, so every rank enters the all_reduce for the same styles.
+        """
+        if not active_styles:
+            return
+        style_flat = self.amp_storage.style_ids.reshape(-1)
+        actor_flat = self.amp_storage.actor_states.reshape(-1, *self.amp_storage.actor_states.shape[2:])
+        reference_flat = self.amp_storage.reference_states.reshape(-1, *self.amp_storage.reference_states.shape[2:])
+        for style in active_styles:
+            normalizer = self.discriminator.discriminators[style].normalizer
+            if normalizer is None:
+                continue
+            mask = style_flat == style
+            balanced_states = torch.cat([actor_flat[mask], reference_flat[mask]], dim=0)
+            if dist.is_initialized():
+                self._ddp_update_normalizer(normalizer, balanced_states)
+            else:
+                normalizer.update(balanced_states)
+
+    def _ddp_update_normalizer(self, normalizer, local_states: torch.Tensor):
+        """All-reduce this rank's local batch into one global (mean, var, count) and fold that
+        single combined batch into `normalizer`, so every rank ends up byte-identical.
+
+        Averaging each rank's *already-updated* local mean/var post-hoc (the old
+        `_sync_discriminator_buffers` approach) is not the same as the true pooled statistic when
+        ranks see different sample counts, and averaging `_var` and `_std` independently breaks
+        the `_std == sqrt(_var)` invariant. Combining raw sum(x)/sum(x**2)/count via a single
+        all_reduce and deriving mean/var from the *global* totals avoids both problems.
+        """
+        local_n = torch.tensor([float(local_states.shape[0])], device=self.device)
+        local_s1 = local_states.sum(dim=0)
+        local_s2 = (local_states**2).sum(dim=0)
+        packed = torch.cat([local_n, local_s1, local_s2])
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        global_n = packed[0]
+        global_s1, global_s2 = packed[1:].chunk(2)
+        global_mean = (global_s1 / global_n).unsqueeze(0)
+        global_var = (global_s2 / global_n - global_mean.squeeze(0) ** 2).unsqueeze(0)
+        normalizer.update_from_moments(global_mean, global_var, global_n)
+
     def update(self, *args, **kwargs):
         mean_losses, average_stats = super().update(*args, **kwargs)
 
@@ -209,6 +262,14 @@ class WasabiAlgoMixin:
         # rank must run the same styles, otherwise the per-step grad all-reduce collectives desync and
         # hang. So drop any style that lacks samples on *any* rank (synchronized via all-reduce MIN).
         active_styles = self._styles_runnable_on_all_ranks(active_styles)
+
+        # Fold this rollout's actor+reference states into each active style's normalizer exactly
+        # once, before any minibatch forward pass reads it. Every forward call in the minibatch
+        # loop below uses `update=False`, so the statistics stay fixed for the rest of this
+        # update() -- otherwise 5 epochs x 4 mini-batches would each nudge the running mean/std,
+        # letting minibatch order and epoch count leak into what should be a fixed scoring rule.
+        self._update_style_normalizers(active_styles)
+
         updates_per_style = self.num_learning_epochs * self.num_mini_batches
         num_updates = max(len(active_styles) * updates_per_style, 1)
         for style in active_styles:
@@ -230,7 +291,6 @@ class WasabiAlgoMixin:
                 self.wasabi_gradient_step(loss, average_stats)
 
         self.amp_storage.clear()
-        self._sync_discriminator_buffers()
 
         return mean_losses, average_stats
 
@@ -240,13 +300,17 @@ class WasabiAlgoMixin:
 
         # discriminator must compute the discriminator during act()
         # TODO: run recurrent discriminator.
+        # update=False: normalizer stats for this style were already folded in once by
+        # `_update_style_normalizers` before the minibatch loop started; must stay frozen here.
         actor_d = discriminator(
             amp_minibatch.actor_states,
             masks=amp_minibatch.masks,
+            update=False,
         )
         reference_d = discriminator(
             amp_minibatch.reference_states,
             masks=amp_minibatch.masks,
+            update=False,
         )
 
         # compute losses of the distriminator
@@ -309,7 +373,7 @@ class WasabiAlgoMixin:
         latent = discriminator.encoders(combined_states).detach()
         latent.requires_grad = True
 
-        disc = discriminator.backbone_run(latent)
+        disc = discriminator.backbone_run(latent, update=False)
 
         ones = torch.ones_like(disc)
         grad = torch.autograd.grad(
@@ -341,6 +405,7 @@ class WasabiAlgoMixin:
         disc = discriminator(
             combined_states,
             masks=amp_minibatch.masks,  # The mask is designed as if the discriminator is recurrent. But it is typically not.
+            update=False,
         )
 
         ones = torch.ones_like(disc)
@@ -403,24 +468,6 @@ class WasabiAlgoMixin:
                 dist.broadcast(param.data, src=0)
             for buf in self.discriminator.buffers():
                 dist.broadcast(buf.data, src=0)
-
-    def _sync_discriminator_buffers(self):
-        """Average the discriminators' float buffers (input-normalizer running stats) across ranks.
-
-        Parameters stay in sync through the gradient all-reduce, but each rank updates its
-        normalizer statistics from its own envs' data; left alone they drift apart and the same
-        state would receive a different style reward depending on the rank. All ranks estimate
-        the same underlying distribution with near-equal sample counts, so a plain average is an
-        adequate merge. Integer buffers (sample counts) stay local: they only control the running
-        update rate, and summing them across syncs would inflate the count.
-        """
-        if not dist.is_initialized():
-            return
-        world_size = dist.get_world_size()
-        for buf in self.discriminator.buffers():
-            if buf.dtype.is_floating_point:
-                dist.all_reduce(buf.data, op=dist.ReduceOp.SUM)
-                buf.data /= world_size
 
     def wasabi_gradient_step(self, loss: torch.Tensor, average_stats: dict):
         self.discriminator_optimizer.zero_grad()
