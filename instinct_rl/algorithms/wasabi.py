@@ -328,9 +328,11 @@ class WasabiAlgoMixin:
         discriminator_loss = (actor_d_loss + reference_d_loss) * 0.5
         if self.discriminator_gradient_penalty_coef > 0:
             if self.discriminator_backbone_gradient_only:
-                discriminator_gradient_penalty = self.compute_discriminator_backbone_gradient(amp_minibatch, style)
+                discriminator_gradient_penalty = self.compute_discriminator_backbone_gradient(
+                    amp_minibatch, style, stats=stats
+                )
             else:
-                discriminator_gradient_penalty = self.compute_discriminator_gradient(amp_minibatch, style)
+                discriminator_gradient_penalty = self.compute_discriminator_gradient(amp_minibatch, style, stats=stats)
         else:
             discriminator_gradient_penalty = torch.zeros(1, device=self.device)[0]
 
@@ -356,9 +358,15 @@ class WasabiAlgoMixin:
 
         return losses, inter_vars, stats
 
-    def compute_discriminator_backbone_gradient(self, amp_minibatch: AmpStorage.MiniBatch, style: int = 0):
+    def compute_discriminator_backbone_gradient(
+        self, amp_minibatch: AmpStorage.MiniBatch, style: int = 0, stats: dict | None = None
+    ):
         """Compute the gradient w.r.t discriminator input.
         In WASABI algorithm, it is used as a penalty to satisfy the condition of Lipschitz continuity
+
+        `stats`, when given, receives the mean *un-clamped* gradient norm. The returned penalty is
+        clamped and squared, so it cannot be read back as the Lipschitz constant being achieved --
+        that raw norm is the quantity to watch when tuning the penalty coefficient.
         """
         discriminator = self.discriminator.discriminators[style]
         reference_states = amp_minibatch.reference_states
@@ -385,40 +393,66 @@ class WasabiAlgoMixin:
             only_inputs=True,
         )[0]
 
-        return torch.clamp(grad.norm(2, dim=1) - self.discriminator_gradient_torlerance, 0).pow(2).mean()
+        grad_norm = grad.norm(2, dim=1)
+        if stats is not None:
+            stats[f"discriminator_grad_norm_{style}"] = grad_norm.mean().detach()
+        return torch.clamp(grad_norm - self.discriminator_gradient_torlerance, 0).pow(2).mean()
 
-    def compute_discriminator_gradient(self, amp_minibatch: AmpStorage.MiniBatch, style: int = 0):
-        """Compute the gradient w.r.t expert input.
-        In WASABI algorithm, it is used as a penalty to satisfy the condition of Lipschitz continuity
+    def compute_discriminator_gradient(
+        self, amp_minibatch: AmpStorage.MiniBatch, style: int = 0, stats: dict | None = None
+    ):
+        """Compute the discriminator's input-gradient penalty in *normalized* coordinate space.
+
+        In WASABI/AMP this penalty enforces Lipschitz continuity of the discriminator. The
+        discriminator normalizes its input as ``z = (x - mean) / (std + eps)`` before the MLP, so a
+        gradient taken w.r.t. the raw input ``x`` equals the gradient w.r.t. ``z`` divided by
+        ``(std + eps)`` per feature. Penalizing the raw-``x`` gradient therefore punishes
+        low-variance features far more than high-variance ones (~18x on this data), which is not the
+        isotropic constraint intended. We differentiate w.r.t. ``z`` instead so every feature is
+        penalized on the same unit-variance scale. Without a normalizer there is no ``z`` space, so
+        we fall back to the raw-input gradient through the full forward (unchanged behavior).
+
+        `stats`, when given, receives the mean *un-clamped* gradient norm. The returned penalty is
+        clamped and squared, so it cannot be read back as the Lipschitz constant being achieved --
+        that raw norm is the quantity to watch when tuning the penalty coefficient.
         """
         discriminator = self.discriminator.discriminators[style]
-        reference_states = amp_minibatch.reference_states
-        reference_states = buffer_func(reference_states, torch.clone)
-        buffer_func(reference_states, setattr, "requires_grad", True)
-
-        actor_states = amp_minibatch.actor_states
-        actor_states = buffer_func(actor_states, torch.clone)
-        buffer_func(actor_states, setattr, "requires_grad", True)
-
+        # torch.cat already produces a fresh tensor decoupled from the rollout buffer; the leaf we
+        # differentiate w.r.t. (`grad_input`) is created explicitly below via detach + requires_grad.
+        reference_states = buffer_func(amp_minibatch.reference_states, torch.clone)
+        actor_states = buffer_func(amp_minibatch.actor_states, torch.clone)
         combined_states = torch.cat([actor_states, reference_states], dim=0)
 
-        disc = discriminator(
-            combined_states,
-            masks=amp_minibatch.masks,  # The mask is designed as if the discriminator is recurrent. But it is typically not.
-            update=False,
-        )
+        if discriminator.normalizer is not None:
+            # Normalize once with frozen stats, then treat z as a fresh leaf and run only the MLP
+            # head on it. `update=False` keeps the running mean/std fixed, matching every other
+            # forward pass in this update(); a normalizer forbids encoders (see Discriminator), so
+            # `discriminator.model(z)` reproduces the full discriminator output for z.
+            grad_input = discriminator.normalizer(combined_states, update=False).detach()
+            grad_input.requires_grad = True
+            disc = discriminator.model(grad_input)
+        else:
+            # Encoder-based / un-normalized discriminator: no z space to differentiate in, so keep
+            # the original raw-input gradient through the full forward. The mask is designed as if
+            # the discriminator is recurrent, but it is typically not.
+            grad_input = combined_states.detach()
+            grad_input.requires_grad = True
+            disc = discriminator(grad_input, masks=amp_minibatch.masks, update=False)
 
         ones = torch.ones_like(disc)
         grad = torch.autograd.grad(
             outputs=disc,
-            inputs=combined_states,
+            inputs=grad_input,
             grad_outputs=ones,
             create_graph=True,
             retain_graph=True,
             only_inputs=True,
         )[0]
 
-        return torch.clamp(grad.norm(2, dim=1) - self.discriminator_gradient_torlerance, 0).pow(2).mean()
+        grad_norm = grad.norm(2, dim=1)
+        if stats is not None:
+            stats[f"discriminator_grad_norm_{style}"] = grad_norm.mean().detach()
+        return torch.clamp(grad_norm - self.discriminator_gradient_torlerance, 0).pow(2).mean()
 
     def state_dict(self):
         state_dict = super().state_dict()
