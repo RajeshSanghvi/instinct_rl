@@ -190,13 +190,31 @@ class ParallelLayer(nn.Module):
     def __str__(self):
         return f"ParallelLayer({len(self.block_configs)} blocks): {self._parallel_blocks}"
 
-    def export_as_onnx(self, flat_input, filedir: str, block_as_seperate_files: bool = True):
-        """Export the model as an ONNX file. Input should be batch-wise observations with batchsize 1."""
+    def export_as_onnx(
+        self,
+        flat_input,
+        filedir: str,
+        block_as_seperate_files: bool = True,
+        opset_version: int = 14,
+        dynamo: bool = False,
+    ):
+        """Export the model as an ONNX file. Input should be batch-wise observations with batchsize 1.
+
+        Args:
+            opset_version: ONNX opset of the exported blocks. 14 is the lowest the legacy
+                exporter accepts for the attention blocks (aten::scaled_dot_product_attention
+                needs >= 14) and produces ONNX IR version 7, which old on-robot onnxruntime
+                builds still load. Note the dynamo exporter ignores this and always writes
+                opset 18 / IR 10.
+            dynamo: use the TorchDynamo-based exporter instead of the legacy tracer.
+        """
         self.eval()
         assert block_as_seperate_files, "Currently only support exporting blocks as separate files."
         with torch.no_grad():
             for block_name in self._parallel_blocks.keys():
-                self.export_one_block_as_onnx(flat_input, filedir, block_name)
+                self.export_one_block_as_onnx(
+                    flat_input, filedir, block_name, opset_version=opset_version, dynamo=dynamo
+                )
 
     def export_as_jit(self, flat_input, filedir: str):
         """Export each block as a TorchScript file. Input should be batch-wise observations with batchsize 1."""
@@ -228,7 +246,7 @@ class ParallelLayer(nn.Module):
         torch.jit.save(traced, save_path)
         print(f"Exported {block_name} to {save_path}")
 
-    def export_one_block_as_onnx(self, flat_input, filedir, block_name):
+    def export_one_block_as_onnx(self, flat_input, filedir, block_name, opset_version: int = 14, dynamo: bool = False):
         block = self._parallel_blocks[block_name]
         block_config = self.block_configs[block_name]
         input_component_names = block_config["component_names"]
@@ -248,16 +266,35 @@ class ParallelLayer(nn.Module):
             if module_is_from_type(block, Conv2dHeadModel):
                 assert len(input_component_names) == 1, "Conv2dHeadModel only accept one obs component for now"
                 input_for_block = input_for_block.reshape(-1, *self.input_segments[input_component_names[0]])
+        save_path = os.path.join(filedir, f"{self._sequential_idx}-{block_name}.onnx")
+        fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
         if module_is_from_type(block, (TransformerHeadModel, CrossAttnFuseHeadModel)):
             torch.backends.cuda.enable_mem_efficient_sdp(False)  # Disable Memory-Efficient Attention
-        exported_program = torch.onnx.export(
-            block,
-            input_for_block,
-            "/tmp/parallel_layer.onnx",  # This file does not contain the model weight, we call the save later to save the onnx with model weight.
-            input_names=input_names,
-            output_names=["output"],
-            dynamo=True,
-            opset_version=15,  # on pytorch 2.4.0 for transformer encoder. Not sure for others.
-        )
-        exported_program.save(os.path.join(filedir, f"{self._sequential_idx}-{block_name}.onnx"))
-        print(f"Exported {block_name} to {os.path.join(filedir, f'{self._sequential_idx}-{block_name}.onnx')}")
+            # nn.MultiheadAttention's fast path lowers to aten::_native_multi_head_attention,
+            # which the legacy exporter has no symbolic for.
+            torch.backends.mha.set_fastpath_enabled(False)
+        try:
+            if dynamo:
+                exported_program = torch.onnx.export(
+                    block,
+                    input_for_block,
+                    "/tmp/parallel_layer.onnx",  # This file does not contain the model weight, we call the save later to save the onnx with model weight.
+                    input_names=input_names,
+                    output_names=["output"],
+                    dynamo=True,
+                    opset_version=opset_version,  # NOTE: ignored by the dynamo exporter (always opset 18 / IR 10)
+                )
+                exported_program.save(save_path)
+            else:
+                torch.onnx.export(
+                    block,
+                    input_for_block,
+                    save_path,
+                    input_names=input_names,
+                    output_names=["output"],
+                    dynamo=False,
+                    opset_version=opset_version,
+                )
+        finally:
+            torch.backends.mha.set_fastpath_enabled(fastpath_enabled)
+        print(f"Exported {block_name} to {save_path}")

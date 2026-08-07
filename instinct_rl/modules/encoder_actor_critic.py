@@ -114,11 +114,18 @@ class EncoderActorCriticMixin:
     def critic_obs_segments(self):
         return self.__critic_obs_segments
 
-    def export_as_onnx(self, observations, filedir, encoder_as_seperate_file=True):
-        """Export the model as an ONNX file. Input should be batch-wise observations with batchsize 1."""
+    def export_as_onnx(self, observations, filedir, encoder_as_seperate_file=True, opset_version=14, dynamo=False):
+        """Export the model as an ONNX file. Input should be batch-wise observations with batchsize 1.
+
+        ``opset_version``/``dynamo`` only affect the encoder blocks; see
+        ``ParallelLayer.export_as_onnx``. Keep the opset low (and thus the ONNX IR
+        version) when the deployment machine runs an old onnxruntime.
+        """
         self.eval()
         if encoder_as_seperate_file:
-            self.encoders.export_as_onnx(observations, filedir, encoder_as_seperate_file)
+            self.encoders.export_as_onnx(
+                observations, filedir, encoder_as_seperate_file, opset_version=opset_version, dynamo=dynamo
+            )
             with torch.no_grad():
                 obs = self.encoders(observations)
             super().export_as_onnx(obs, filedir)

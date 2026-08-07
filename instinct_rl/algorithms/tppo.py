@@ -160,7 +160,16 @@ class TPPO(PPO):
     def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1):
         self.transition = ActionLabelRollout.Transition()
         obs_size = get_subobs_size(obs_format["policy"])
-        critic_obs_size = get_subobs_size(obs_format.get("critic")) if "critic" in obs_format else None
+        # In pure distillation (using_ppo=False) the critic obs is only consumed during rollout, to query the
+        # teacher for action labels (see `act`). It takes part in no loss: `compute_returns` is skipped and
+        # `compute_losses` only reads obs / masks / actor hidden states / action_labels. Keeping it out of the
+        # buffer saves its share of the rollout memory twice over, since the recurrent minibatch generator also
+        # holds a padded copy. The storage falls back to the policy obs wherever critic obs would be read.
+        critic_obs_size = (
+            get_subobs_size(obs_format["critic"]) if ("critic" in obs_format and self.using_ppo) else None
+        )
+        if "critic" in obs_format and not self.using_ppo:
+            print("TPPO: using_ppo=False, critic observations are not stored in the rollout buffer.")
         self.storage = ActionLabelRollout(
             num_envs,
             num_transitions_per_env,
