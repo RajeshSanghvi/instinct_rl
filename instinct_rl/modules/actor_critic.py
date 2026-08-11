@@ -141,6 +141,41 @@ class ActorCritic(nn.Module):
     def reset(self, dones=None):
         pass
 
+    """
+    Actor hidden-state interface.
+
+    Stateful truncated BPTT (see ``instinct_rl.algorithms.Distillation``) needs to save the
+    actor's recurrent carry, restore it, cut the graph at chunk boundaries and zero it at
+    episode boundaries -- without knowing whether the policy is recurrent at all, or whether
+    its memory is a GRU or an LSTM. Non-recurrent policies implement the whole interface as
+    no-ops so callers never have to branch on ``is_recurrent``.
+    """
+
+    def get_actor_hidden_state(self):
+        """Return a detached copy of the actor carry, or None for a non-recurrent policy."""
+        return None
+
+    def set_actor_hidden_state(self, hidden_state):
+        """Restore an actor carry previously obtained from :meth:`get_actor_hidden_state`."""
+        if hidden_state is not None:
+            raise ValueError(
+                f"{type(self).__name__} is not recurrent and has no actor hidden state to set."
+            )
+
+    def detach_actor_hidden_state(self):
+        """Cut the autograd graph at the current carry (TBPTT chunk boundary)."""
+        pass
+
+    def mask_actor_hidden_state(self, dones):
+        """Zero the carry of finished environments *without* detaching the rest.
+
+        This is the replay-time counterpart of ``reset(dones)``. ``reset`` detaches the whole
+        carry, which would silently truncate BPTT to a single step if it were used inside a
+        gradient-carrying replay; this method keeps the graph alive for the environments that
+        did not terminate.
+        """
+        pass
+
     def forward(self):
         raise NotImplementedError
 

@@ -381,9 +381,11 @@ class OnPolicyRunner:
             )
             for k, v in locs["losses"].items():
                 log_string += f"""{k:>{pad}} {v.item():.4f}\n"""
+            # NOTE: value_loss / surrogate_loss are already covered by the loop above. Printing
+            # them again by name here also made this branch crash for any algorithm that does not
+            # produce PPO losses (e.g. Distillation), which is reached whenever no episode has
+            # finished yet.
             log_string += (
-                f"""{'Value function loss:':>{pad}} {locs["losses"]['value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs["losses"]['surrogate_loss']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 # f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
                 # f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n"""

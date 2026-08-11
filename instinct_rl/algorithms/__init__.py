@@ -28,6 +28,7 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+from .distillation import Distillation, TeacherPolicy
 from .estimator import EstimatorPPO, EstimatorTPPO
 from .lipschitz import LipschitzPPO
 from .ppo import PPO
@@ -47,6 +48,8 @@ class WasabiEstimatorPPO(WasabiAlgoMixin, EstimatorPPO):
 __all__ = [
     "PPO",
     "TPPO",
+    "Distillation",
+    "TeacherPolicy",
     "EstimatorPPO",
     "EstimatorTPPO",
     "LipschitzPPO",

@@ -29,6 +29,7 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 from .demonstration import DemonstrationSaver
+from .distillation_runner import DistillationRunner
 from .on_policy_runner import OnPolicyRunner
 from .two_stage_runner import TwoStageRunner
 

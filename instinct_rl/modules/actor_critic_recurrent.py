@@ -46,6 +46,22 @@ from .actor_critic import ActorCritic, get_activation
 ActorCriticHiddenState = namedarraytuple("ActorCriticHiddenState", ["actor", "critic"])
 
 
+def map_hidden_state(hidden_state, fn):
+    """Apply ``fn`` to every tensor in a hidden state, preserving the container type.
+
+    A carry is either ``None``, a plain tensor (GRU), or an ``LstmHiddenState``
+    namedarraytuple of two tensors. Iterating a namedarraytuple yields its fields, so the
+    recursion below rebuilds the same type rather than collapsing it to a tuple -- downstream
+    ``.hidden`` / ``.cell`` access keeps working.
+    """
+    if hidden_state is None:
+        return None
+    if torch.is_tensor(hidden_state):
+        return fn(hidden_state)
+    fields = [map_hidden_state(field, fn) for field in hidden_state]
+    return tuple(fields) if type(hidden_state) is tuple else type(hidden_state)(*fields)
+
+
 class ActorCriticRecurrent(ActorCritic):
     is_recurrent = True
 
@@ -130,6 +146,41 @@ class ActorCriticRecurrent(ActorCritic):
 
     def get_hidden_states(self):
         return ActorCriticHiddenState(self.memory_a.hidden_states, self.memory_c.hidden_states)
+
+    """
+    Actor hidden-state interface (see ActorCritic for the contract).
+    """
+
+    def get_actor_hidden_state(self):
+        return map_hidden_state(self.memory_a.hidden_states, lambda t: t.detach().clone())
+
+    def set_actor_hidden_state(self, hidden_state):
+        def _check(t):
+            if t.is_inference():
+                raise RuntimeError(
+                    "Refusing to install an inference-mode tensor as the actor carry: it can never"
+                    " take part in autograd, so the next gradient-carrying replay would fail deep"
+                    " inside the RNN. The carry must come from a replay (or a torch.no_grad()"
+                    " refresh), never from a rollout collected under torch.inference_mode()."
+                )
+            return t.detach().clone()
+
+        self.memory_a.hidden_states = map_hidden_state(hidden_state, _check)
+
+    def detach_actor_hidden_state(self):
+        self.memory_a.hidden_states = map_hidden_state(self.memory_a.hidden_states, lambda t: t.detach())
+
+    def mask_actor_hidden_state(self, dones):
+        if self.memory_a.hidden_states is None or dones is None:
+            return
+
+        def _mask(t):
+            keep = (~dones.to(device=t.device, dtype=torch.bool).reshape(-1)).to(t.dtype)
+            if keep.numel() != t.shape[1]:
+                raise ValueError(f"Expected dones to have {t.shape[1]} elements, got {keep.numel()}.")
+            return t * keep.view(1, -1, 1)
+
+        self.memory_a.hidden_states = map_hidden_state(self.memory_a.hidden_states, _mask)
 
     def export_as_onnx(self, observations, filedir):
         assert isinstance(self.memory_a.rnn, torch.nn.GRU), "ONNX export only supports GRU for now."
