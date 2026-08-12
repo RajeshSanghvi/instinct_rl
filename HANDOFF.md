@@ -22,6 +22,7 @@ RTX 4090); imports and `ruff` are clean. One real bug was found and fixed in the
 | `tests/test_distillation_recurrent.py` | carry handling, BPTT depth, episode boundaries |
 | `tests/test_distillation_storage.py` | storage ordering / capacity |
 | `tests/test_distillation_accumulation_ema.py` | gradient accumulation + weight EMA (the *Now You See That* recipe) |
+| `tests/test_distillation_config_guards.py` | fail-fast guards: teacher checkpoint, unknown keys, obs aliasing, weight selection |
 | `tests/test_distillation_integration.py` | **GPU**: real `learn()` loop, teacher checkpoint loading, runner guards, resume |
 | `pytest.ini` | test discovery config |
 
@@ -215,9 +216,15 @@ iteration, not 2.5. Use `lr_scheduler_step_unit: update` if you want one step pe
 **`accumulate_gradients`.** Off by default. On, every TBPTT chunk's gradient is accumulated and
 the rollout produces **one** clipped optimizer step instead of `ceil(T/G)`. Two consequences:
 
-- The weights do not change during the replay, so the carry entering each chunk comes from
-  exactly the weights being trained. The residual one-step staleness described in §2 disappears,
-  and `refresh_hidden_after_update` becomes pointless.
+- The weights do not change *during* the replay, so every chunk is differentiated at the same
+  parameter version. This removes the inter-chunk weight skew but **not** all staleness: the
+  optimizer step happens after the replay, so the carry handed to the next rollout was still
+  produced by the pre-step weights. What changes is that the staleness becomes uniform and
+  exactly one optimizer step instead of a mixture spanning the update.
+  `refresh_hidden_after_update` is what removes that last step, and it stays useful here.
+  (Even with refresh on, only the *current* rollout is replayed at the final weights — the
+  carry entering that rollout still came from earlier history. Stateful TBPTT is bounded
+  staleness, never full self-consistency.)
 - `max_grad_norm` now clips the whole rollout's gradient, and the lr schedule advances once per
   iteration. Both change what a given hyper-parameter means, hence opt-in.
 
@@ -241,9 +248,36 @@ Verified over a full 4000-iteration schedule: 4000 optimizer steps, lr starts at
 **`ema_decay`.** `None` disables it. When set, an EMA of the student weights is updated after
 every optimizer step and **checkpointed as `model_state_dict`** — the slot `OnPolicyRunner` and
 the exporters read — while the raw weights ride along under `raw_model_state_dict` so a resume
-continues the trajectory the optimizer state describes. `export_as_jit` / `export_as_onnx` trace
-`alg.actor_critic` directly, so call `alg.load_ema_into_model()` first if the exported artefact
-should match the checkpoint. Checkpoints written before EMA existed still load.
+continues the trajectory the optimizer state describes. Checkpoints written before EMA existed
+still load.
+
+`get_inference_policy`, `export_as_jit` and `export_as_onnx` all read `alg.actor_critic`
+directly, so an export would otherwise ship weights the checkpoint does not contain. Select
+explicitly, and non-destructively:
+
+```python
+with alg.use_student_weights("ema"):
+    runner.export_as_onnx(...)
+```
+
+It restores on exit (including on exception), so it is safe mid-training — leaving the average
+installed would corrupt the next step, since the optimizer state belongs to the raw weights.
+
+**Fail-fast configuration.** Three misconfigurations used to produce a healthy-looking loss curve
+and a wrong result; all three now raise at construction:
+
+- **No teacher checkpoint.** A randomly initialized teacher gives a perfectly smooth loss — the
+  student imitates noise. Pass `allow_random_teacher: true` if that is genuinely intended.
+- **An absolute `teacher_checkpoint` with no `teacher_logdir`** used to be silently ignored and
+  fall through to a random teacher. It is now honoured, with the run directory derived from the
+  checkpoint so the normalizer lookup still resolves.
+- **Unknown config keys.** A config half-ported from PPO/TPPO (`num_learning_epochs`,
+  `num_mini_batches`, `teacher_act_prob`, `distill_target`, `buffer_dilation_ratio`,
+  `denoise_loss_coef`, …) or a typo like `gradient_lenght` used to warn and carry on, so the run
+  trained fine and its recorded config did not describe what actually ran.
+
+`gradient_length`, `learning_rate` and `max_grad_norm` are range-checked too. `learning_rate: 0`
+stays legal — it freezes the weights while still populating `.grad`.
 
 **Normalizer ownership.** The teacher normalizes its own observations using the normalizer stored
 in its checkpoint. Do **not** configure `normalizers.critic` (or whichever group

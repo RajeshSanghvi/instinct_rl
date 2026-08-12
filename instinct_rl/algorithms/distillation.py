@@ -26,6 +26,7 @@ its own recurrent carry stays continuous across iterations, and its architecture
 decoupled from the student's.
 """
 
+import contextlib
 import os
 import os.path as osp
 import time
@@ -70,11 +71,26 @@ class TeacherPolicy:
         num_rewards,
         logdir=None,
         checkpoint=None,
+        allow_random_teacher=False,
         device="cpu",
     ):
         self.device = device
         self.logdir = logdir
         self.checkpoint = checkpoint
+
+        # An absolute `checkpoint` is enough to find the weights on its own -- `_resolve_model_path`
+        # already handles it -- but the normalizer lives at `<logdir>/params/agent.yaml`, so the
+        # run directory is derived from the checkpoint rather than the pair being silently
+        # ignored. Without this, `teacher_checkpoint="/abs/path/model.pt"` with no `teacher_logdir`
+        # trained happily against a *randomly initialized* teacher.
+        if self.logdir is None and self.checkpoint is not None:
+            if not osp.isabs(self.checkpoint):
+                raise ValueError(
+                    f"teacher_checkpoint={self.checkpoint!r} is a relative path but no teacher_logdir"
+                    " was given, so it cannot be resolved. Pass teacher_logdir, or make the"
+                    " checkpoint path absolute."
+                )
+            self.logdir = osp.dirname(self.checkpoint)
 
         policy_cfg = dict(policy_cfg)
         # The teacher's actor was trained on its own "policy" group. When distilling from a
@@ -95,9 +111,20 @@ class TeacherPolicy:
         ).to(device)
         self.normalizer = None
 
-        if logdir is None:
+        if self.logdir is None:
+            # A random teacher produces a perfectly smooth, perfectly meaningless loss curve --
+            # the student learns to imitate noise and nothing anywhere else complains. That is a
+            # failure mode worth an exception rather than a line of yellow text in a log nobody
+            # reads until the run has burned a day of GPU.
+            if not allow_random_teacher:
+                raise ValueError(
+                    "No teacher checkpoint was given (both teacher_logdir and teacher_checkpoint are"
+                    " None), so the teacher would be randomly initialized and every action label"
+                    " meaningless. Set teacher_logdir (and optionally teacher_checkpoint), or pass"
+                    " allow_random_teacher=True if an untrained teacher is genuinely intended."
+                )
             print(
-                "\033[43;33mDistillation warning: no teacher checkpoint given; the teacher is randomly"
+                "\033[43;33mDistillation warning: allow_random_teacher is set; the teacher is randomly"
                 " initialized and its labels are meaningless.\033[0m"
             )
         else:
@@ -220,6 +247,7 @@ class Distillation:
         teacher_policy_class_name="ActorCriticRecurrent",
         teacher_policy=None,
         teacher_obs_source="critic",
+        allow_random_teacher=False,
         # -- loss
         loss_type="mse_sum",
         # -- optimisation
@@ -258,10 +286,15 @@ class Distillation:
                 clipped optimizer step per rollout, instead of one step per chunk. Two effects
                 worth knowing:
 
-                * The weights no longer change during the replay, so the carry entering each
-                  chunk is produced by exactly the weights being trained -- the residual
-                  one-optimizer-step staleness described in the module docstring disappears,
-                  and ``refresh_hidden_after_update`` becomes pointless.
+                * The weights do not change *during* the replay, so every chunk is differentiated
+                  at the same parameter version. This removes the inter-chunk weight skew, but
+                  **not** all staleness: the optimizer step happens after the replay, so the
+                  carry handed to the next rollout was still produced by the pre-step weights.
+                  What changes is that the staleness becomes uniform and exactly one optimizer
+                  step, instead of a mixture spanning the whole update.
+                  ``refresh_hidden_after_update`` is what removes that remaining step, and it
+                  stays useful here -- arguably more so, since one refresh now cancels the only
+                  skew left.
                 * ``max_grad_norm`` then clips the whole rollout's gradient rather than one
                   chunk's, and the lr schedule advances once per iteration instead of
                   ``ceil(T/G)`` times. Both change what a given hyper-parameter means, which is
@@ -275,7 +308,28 @@ class Distillation:
                 a one-optimizer-step-old carry, so it is off by default; keep it as an ablation.
         """
         if kwargs:
-            print("\033[43;33mWarning: Distillation init got extra kwargs:", kwargs.keys(), "\033[0m")
+            # Distillation shares a config slot with PPO/TPPO, so a half-ported config is the
+            # normal way to arrive here: `num_learning_epochs`, `num_mini_batches`,
+            # `teacher_act_prob`, `distill_target`, `buffer_dilation_ratio`, `denoise_loss_coef`
+            # are all silently meaningless to this algorithm. So is a typo like `gradient_lenght`,
+            # which would leave gradient_length at its default. A warning is not enough: the run
+            # trains fine, finishes, and its recorded config does not describe what actually ran.
+            raise TypeError(
+                f"Distillation got unknown config keys: {sorted(kwargs)}.\n"
+                "These have no effect here. If this config was ported from PPO/TPPO, remove the"
+                " keys that do not apply (num_learning_epochs, num_mini_batches, teacher_act_prob,"
+                " distill_target, buffer_dilation_ratio, hidden_state_resample_prob, ...); if one"
+                " is a typo, check it against the Distillation signature."
+            )
+
+        if not (isinstance(gradient_length, int) and gradient_length > 0):
+            raise ValueError(f"gradient_length must be a positive integer, got {gradient_length!r}")
+        # 0.0 is allowed on purpose: it freezes the weights while still populating .grad, which
+        # is how the tests inspect gradients without the update perturbing what they measure.
+        if learning_rate < 0:
+            raise ValueError(f"learning_rate must be non-negative, got {learning_rate!r}")
+        if max_grad_norm is not None and not max_grad_norm > 0:
+            raise ValueError(f"max_grad_norm must be positive or None, got {max_grad_norm!r}")
 
         self.device = device
         self.actor_critic = actor_critic
@@ -328,6 +382,7 @@ class Distillation:
         self._teacher_cfg = dict(
             logdir=teacher_logdir,
             checkpoint=teacher_checkpoint,
+            allow_random_teacher=allow_random_teacher,
             policy_class_name=teacher_policy_class_name,
             policy_cfg=dict(teacher_policy or {}),
         )
@@ -395,7 +450,13 @@ class Distillation:
             )
 
         self._pending_teacher_mean = self.teacher.act_inference(teacher_obs).detach()
-        self._pending_student_obs = obs
+        # Cloned, not aliased. This observation is only copied into storage after env.step()
+        # returns, and an environment that writes its observations into a reused buffer would by
+        # then have overwritten it with obs[t+1] -- pairing obs[t+1] with the label for obs[t],
+        # a one-step misalignment that no loss curve would reveal. IsaacLab usually allocates a
+        # fresh tensor per step, and a configured normalizer makes a fresh one regardless, but
+        # correctness here should not depend on either.
+        self._pending_student_obs = obs.detach().clone()
         # Sampled, not the mean: the exploration noise is what gives the student state coverage
         # beyond the trajectory band it would otherwise stay on. std is frozen, so this is a
         # constant-width perturbation throughout training.
@@ -515,14 +576,40 @@ class Distillation:
             else:
                 shadow.copy_(value)  # e.g. integer counters -- averaging them is meaningless
 
-    def load_ema_into_model(self):
-        """Overwrite the live student with its EMA weights.
+    @contextlib.contextmanager
+    def use_student_weights(self, which="ema"):
+        """Temporarily install a different weight set on the live student, then restore.
 
-        Checkpoints already store the EMA weights as ``model_state_dict``, but ``export_as_jit``
-        / ``export_as_onnx`` trace ``alg.actor_critic`` directly. Call this before exporting (or
-        before an eval rollout) if you want the exported artefact to match the checkpoint.
-        Training should not continue afterwards -- the optimizer state belongs to the raw
-        weights, not the averaged ones.
+        Checkpoints store the EMA weights as ``model_state_dict``, but ``get_inference_policy``,
+        ``export_as_jit`` and ``export_as_onnx`` all read ``alg.actor_critic`` directly, so
+        without this an export silently ships weights the checkpoint does not contain::
+
+            with alg.use_student_weights("ema"):
+                runner.export_as_onnx(...)
+
+        Restoring on exit is what makes this safe to use mid-training: the optimizer state
+        belongs to the raw weights, so leaving the average installed would corrupt the next step.
+        """
+        if which not in ("raw", "ema"):
+            raise ValueError(f"which must be 'raw' or 'ema', got {which!r}")
+        if which == "raw" or self._ema_state is None:
+            if which == "ema":
+                raise RuntimeError("No EMA is being maintained; construct Distillation with ema_decay.")
+            yield self.actor_critic
+            return
+
+        saved = {k: v.detach().clone() for k, v in self.actor_critic.state_dict().items()}
+        self.actor_critic.load_state_dict(self._ema_state)
+        try:
+            yield self.actor_critic
+        finally:
+            self.actor_critic.load_state_dict(saved)
+
+    def load_ema_into_model(self):
+        """Destructively overwrite the live student with its EMA weights.
+
+        Prefer :meth:`use_student_weights`, which restores afterwards. Training must not continue
+        after this call -- the optimizer state belongs to the raw weights, not the averaged ones.
         """
         if self._ema_state is None:
             raise RuntimeError("No EMA is being maintained; construct Distillation with ema_decay.")
