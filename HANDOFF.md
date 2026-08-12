@@ -3,8 +3,9 @@
 Teacher-student distillation (privileged teacher → deployable student, behaviour cloning only,
 no RL fine-tuning stage) with stateful truncated BPTT for recurrent students.
 
-**Status: written, never executed.** The machine this was authored on has no Python, so nothing
-below has been imported, let alone run. Treat the test suite as the first task, not as evidence.
+**Status: executed and green as of 2026-08-11.** 52 tests pass on `env_isaaclab` (torch 2.7.0,
+RTX 4090); imports and `ruff` are clean. One real bug was found and fixed in the process
+(teacher checkpoint loading, §1a). The remaining unverified step is a real training run (§7.4).
 
 ---
 
@@ -20,6 +21,8 @@ below has been imported, let alone run. Treat the test suite as the first task, 
 | `tests/test_distillation_accumulation.py` | chunking, tail flush, step-size invariance, lr schedule |
 | `tests/test_distillation_recurrent.py` | carry handling, BPTT depth, episode boundaries |
 | `tests/test_distillation_storage.py` | storage ordering / capacity |
+| `tests/test_distillation_accumulation_ema.py` | gradient accumulation + weight EMA (the *Now You See That* recipe) |
+| `tests/test_distillation_integration.py` | **GPU**: real `learn()` loop, teacher checkpoint loading, runner guards, resume |
 | `pytest.ini` | test discovery config |
 
 Modified:
@@ -43,6 +46,29 @@ untouched apart from the one `on_policy_runner.py` log fix described in §6.
 - `VaeDistill` is a `TPPO` subclass adding a KL term.
 
 None of them do online, in-process, student-only distillation with stateful TBPTT.
+
+### 1a. Bug found and fixed on first execution
+
+`TeacherPolicy._load` used `load_state_dict(..., strict=False)` and assumed that made critic-path
+mismatches non-fatal. It does not: `strict=False` forgives *missing* and *unexpected keys* but
+still raises on a **size mismatch for a key that is present**. So the case the code explicitly
+documented as supported — a privileged teacher whose value function saw more than its actor, e.g.
+a height scan the distillation env does not expose — failed to load at all:
+
+```
+RuntimeError: size mismatch for critic.0.weight: copying a param with shape
+torch.Size([32, 29]) ... the shape in current model is torch.Size([32, 9]).
+```
+
+`_load` now partitions the checkpoint by shape before loading: mismatched **critic** tensors are
+dropped (with a printed summary), mismatched **actor** tensors are collected and re-raised in the
+existing diagnostic. Regression test:
+`test_distillation_integration.py::test_teacher_with_a_wider_critic_obs_group_still_loads`.
+
+The actor/critic split itself (`_is_critic_key`) was checked against a real 106-tensor checkpoint
+(`logs/instinct_rl/remote/20260807_153321`): `actor`, `encoders`, `memory_a`, `std` require an
+exact load; `critic`, `critic_encoders`, `memory_c` are tolerated. Nothing on the actor path
+leaks into the tolerated set — which is the direction that would silently produce wrong labels.
 
 ---
 
@@ -167,6 +193,9 @@ algorithm:
   optimizer_class_name: Adam
   freeze_action_std: true
 
+  accumulate_gradients: false             # see below
+  ema_decay: null                         # e.g. 0.997
+
   refresh_hidden_after_update: false
 
   lr_scheduler_class_name: CosineAnnealingLR
@@ -177,9 +206,44 @@ algorithm:
 ```
 
 **Scheduler units.** `lr_scheduler_step_unit: optimizer_step` (the default) steps the scheduler
-`num_steps_per_env / gradient_length` times per iteration. With `T=48`, `G=24` and 4000
-iterations that is **8000** scheduler steps, not 4000. Setting `T_max: 4000` here would halve the
-cosine period. Use `lr_scheduler_step_unit: update` if you want one step per iteration.
+once per optimizer step, i.e. `ceil(num_steps_per_env / gradient_length)` times per iteration
+when `flush_tail` is on — the tail flush is an optimizer step and steps the scheduler too. With
+`T=48`, `G=24` and 4000 iterations there is no tail, so that is **8000** scheduler steps, not
+4000; setting `T_max: 4000` would halve the cosine period. But with e.g. `T=20, G=8` it is 3 per
+iteration, not 2.5. Use `lr_scheduler_step_unit: update` if you want one step per iteration.
+
+**`accumulate_gradients`.** Off by default. On, every TBPTT chunk's gradient is accumulated and
+the rollout produces **one** clipped optimizer step instead of `ceil(T/G)`. Two consequences:
+
+- The weights do not change during the replay, so the carry entering each chunk comes from
+  exactly the weights being trained. The residual one-step staleness described in §2 disappears,
+  and `refresh_hidden_after_update` becomes pointless.
+- `max_grad_norm` now clips the whole rollout's gradient, and the lr schedule advances once per
+  iteration. Both change what a given hyper-parameter means, hence opt-in.
+
+Chunk losses are weighted by chunk *length* (`sum / graded_steps`), not by `1/num_chunks`, so a
+short tail chunk does not pull as hard as a full one.
+
+**Reproducing *Now You See That* (Table XII).** `num_steps_per_env: 800`, `gradient_length: 80`
+(= 10 accumulation steps), `accumulate_gradients: true`, `max_grad_norm: 1.0`, `ema_decay: 0.997`,
+and:
+
+```yaml
+  learning_rate: 1.0e-3
+  lr_scheduler_class_name: OneCycleLR
+  lr_scheduler: {max_lr: 1.0e-2, total_steps: 4000, div_factor: 10.0, final_div_factor: 50.0}
+  lr_scheduler_step_unit: optimizer_step   # == one step per iteration under accumulation
+```
+
+Verified over a full 4000-iteration schedule: 4000 optimizer steps, lr starts at 1.0e-3, peaks at
+1.0e-2 (iteration 1198, the default `pct_start=0.3`), ends at 2.0e-5.
+
+**`ema_decay`.** `None` disables it. When set, an EMA of the student weights is updated after
+every optimizer step and **checkpointed as `model_state_dict`** — the slot `OnPolicyRunner` and
+the exporters read — while the raw weights ride along under `raw_model_state_dict` so a resume
+continues the trajectory the optimizer state describes. `export_as_jit` / `export_as_onnx` trace
+`alg.actor_critic` directly, so call `alg.load_ema_into_model()` first if the exported artefact
+should match the checkpoint. Checkpoints written before EMA existed still load.
 
 **Normalizer ownership.** The teacher normalizes its own observations using the normalizer stored
 in its checkpoint. Do **not** configure `normalizers.critic` (or whichever group
@@ -289,10 +353,12 @@ nothing calls `.item()` until `update()` returns. Keep it that way — a `.item(
 replay loop adds one full pipeline stall per environment step.
 
 **`torch.load` in `TeacherPolicy._load`** uses `map_location="cpu"` with no `weights_only`
-argument, matching `TPPO`. On torch >= 2.6 the default flipped to `weights_only=True`; the saved
-dict is plain tensors/dicts/primitives so it should load, but if a teacher checkpoint was written
-with a richer `infos` payload this is where it will fail, and the fix is an explicit
-`weights_only=False`.
+argument, matching `TPPO`. On torch >= 2.6 the default flipped to `weights_only=True`.
+**Verified fine on torch 2.7.0** against a real 30k-iteration checkpoint
+(`logs/instinct_rl/remote/20260807_153321/model_20000.pt`), which loaded cleanly. This is not
+luck: `OnPolicyRunner.load` itself passes `weights_only=True`, so any checkpoint this repo can
+resume from is loadable here too. If a teacher were ever written with a richer `infos` payload
+than the runner can read back, the fix is an explicit `weights_only=False`.
 
 **Multi-GPU still raises** (§8). `OnPolicyRunner.learn` calls `distributed_data_parallel()` when
 `dist.is_initialized()`, so a distributed launch fails immediately and loudly instead of training
@@ -320,19 +386,36 @@ python -c "import instinct_rl.algorithms, instinct_rl.storage, instinct_rl.runne
 ruff check instinct_rl tests     # or whatever this repo uses
 ```
 
-Most likely failure: an import cycle. `algorithms/__init__.py` now imports `distillation`, which
-imports `instinct_rl.modules` and `instinct_rl.storage.distillation_storage`. `modules/__init__`
-does not import `algorithms`, so it should be fine, but this is the first thing to check.
+**Done — both clean.** No import cycle; `ruff check` passes on the new modules and `tests/`.
 
 ### 7.2 Test suite
 
 ```bash
-python -m pytest tests -v
+source parkour/env_isaaclab/bin/activate
+python -m pytest tests -q          # 52 passed
 ```
 
-Every test is CPU-only, second-scale, and simulator-free. **None of them have been run.** Expect
-to fix mechanical things — an argument name, a shape, a tolerance. Specific ones I would look at
-first:
+**Done — 52 passed.** The 37 unit tests are CPU-only, second-scale and simulator-free; the 15
+integration tests need a GPU (they are skipped without one, because `OnPolicyRunner.log` calls
+`torch.cuda.mem_get_info` unconditionally).
+
+Only one unit test needed fixing, and it was the test, not the algorithm:
+`test_environment_always_executes_the_student_action` set `std` to exactly `0.0` to make sampling
+deterministic. `Normal` rejects a zero scale — and this repo's attempt to turn that validation off
+is itself broken (see the note below) — so the test now uses `1e-8` and additionally asserts the
+executed action *is* the student's `action_mean`, which is a stronger statement than the original.
+
+> **Pre-existing repo bug, untouched, worth a separate fix.** `actor_critic.py:98` reads
+> `Normal.set_default_validate_args = False`. That **assigns to** the classmethod instead of
+> **calling** it, so distribution validation has never actually been disabled anywhere in this
+> repo — every `update_distribution` call in PPO/TPPO pays for it. The one-character fix is
+> `Normal.set_default_validate_args(False)`. Left alone here because it changes behaviour for
+> every existing algorithm (it also removes a NaN canary on the action mean), which is not
+> something a distillation review should decide unilaterally. Note the practical consequence
+> meanwhile: **`init_noise_std: 0` crashes**, which is a tempting setting for behaviour cloning
+> since the std receives no gradient anyway. Use a small positive value.
+
+Notes on the tests I flagged as fragile — all held up:
 
 - `test_stepwise_replay_matches_a_batched_rnn_over_the_whole_sequence` assumes
   `rnn_highway=False` (the default). If the helper ever enables highway, the reference path must
@@ -341,13 +424,17 @@ first:
   exceeds `1e-6` on random init. Almost certain, but it is a statistical assumption.
 - `test_logged_behavior_loss_covers_every_timestep_including_the_tail` uses a loose `rel=0.5`
   because later chunks are computed with updated weights. Tighten only if you also freeze the lr.
-- `helpers.StubTeacher` sidesteps `TeacherPolicy` entirely, so **checkpoint loading is not
-  covered by any test.** See 7.3.
+- `helpers.StubTeacher` sidesteps `TeacherPolicy` entirely. That gap is now closed by
+  `test_distillation_integration.py`, which writes a real teacher run to disk (checkpoint +
+  `params/agent.yaml` + a non-identity normalizer) and loads it through `TeacherPolicy`.
 
 ### 7.3 Teacher loading — the first real-data step
 
-`TeacherPolicy._load` is the least testable and most likely-to-bite part. Verify against a real
-teacher run before starting a long job:
+`TeacherPolicy._load` is the least testable and most likely-to-bite part — and it is where the
+§1a bug was. Steps 1-4 below are now automated in `test_distillation_integration.py`
+(`test_teacher_labels_match_the_teacher_run_normalized_exactly_once`,
+`test_teacher_normalizer_is_loaded_and_frozen`), against a synthetic-but-real teacher run.
+Still walk through them once against **your** teacher before starting a long job:
 
 1. Point `teacher_logdir` at a finished teacher run and construct the runner.
 2. Confirm the printed "loading teacher policy from ..." path is the checkpoint you expect.
@@ -359,9 +446,11 @@ teacher run before starting a long job:
    **Do this.** A silently mis-normalized teacher produces plausible-looking labels and an
    apparently healthy loss curve.
 
-The loader accepts missing/unexpected keys on the *critic* path (the teacher's value function is
-never used and its observation group may not exist in the distillation env) but raises on any
-mismatch on the actor path.
+The loader accepts missing/unexpected keys **and shape mismatches** on the *critic* path (the
+teacher's value function is never used and its observation group may not exist in the
+distillation env) but raises on any mismatch on the actor path. The shape half of that was
+broken until §1a — if you are reading a copy of this file from before 2026-08-11, a privileged
+teacher would not load at all.
 
 If `teacher_policy` has no `obs_format`, one is derived as
 `{"policy": env_obs_format[teacher_obs_source], "critic": <same>}`. Pass an explicit
@@ -401,5 +490,7 @@ Only after the smoke run looks sane: full run at `num_steps_per_env: 48`, `gradi
 - **`TeacherPolicy` normalizer lookup is hard-coded to the `policy` group** of the teacher's
   `params/agent.yaml`, matching `TPPO`. A teacher trained with a differently-named group will
   need a small change in `_load_normalizer`.
-- **No test covers `DistillationRunner`**, because constructing it needs a `VecEnv`. Its three
-  checks are simple enough to read, but they are unexercised.
+- ~~**No test covers `DistillationRunner`**~~ — closed. `tests/test_distillation_integration.py`
+  defines a `StubVecEnv` and drives the real `OnPolicyRunner.learn()` loop, so all three runner
+  guards, the rollout under `torch.inference_mode`, checkpointing and resume are exercised. That
+  loop is also the only place the inference-tensor carry trap (§5) can actually occur.

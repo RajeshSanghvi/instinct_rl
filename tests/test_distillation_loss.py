@@ -34,7 +34,11 @@ def test_unknown_loss_type_is_rejected():
 def test_environment_always_executes_the_student_action():
     """The core invariant: the teacher labels, it never drives the environment."""
     alg = make_algorithm()
-    alg.actor_critic.std.data.fill_(0.0)  # make sampling deterministic so we can compare exactly
+    # Sampling noise is collapsed so the executed action can be compared against the student's
+    # own mean exactly. It is made *small*, not zero: `Normal` rejects a zero scale, and this
+    # repo's attempt to disable that validation (`Normal.set_default_validate_args = False` in
+    # actor_critic.py) assigns to the classmethod instead of calling it, so validation is live.
+    alg.actor_critic.std.data.fill_(1e-8)
 
     obs = torch.randn(NUM_ENVS, STUDENT_OBS_DIM)
     critic_obs = torch.randn(NUM_ENVS, TEACHER_OBS_DIM)
@@ -45,6 +49,10 @@ def test_environment_always_executes_the_student_action():
     assert executed.shape == (NUM_ENVS, NUM_ACTIONS)
     assert not torch.allclose(executed, teacher_label), "executed action must not be the teacher's"
     assert alg.teacher.act_calls == 1
+    # Stronger than "not the teacher's": it is positively the student's own action mean.
+    # `action_mean` is read rather than calling act_inference(obs) again -- for a recurrent
+    # student a second call would advance the carry and evaluate a *different* timestep.
+    assert torch.allclose(executed, alg.actor_critic.action_mean, atol=1e-6)
 
 
 def test_stored_label_is_the_teacher_mean_not_the_executed_action():

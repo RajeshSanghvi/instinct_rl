@@ -124,19 +124,47 @@ class TeacherPolicy:
         print(f"Distillation: loading teacher policy from {model_path}")
         state_dict = torch.load(model_path, map_location="cpu")
 
-        # The teacher's critic is never used for distillation, and its observation group may
-        # not even exist in the distillation env, so a shape mismatch there is not an error.
-        # Everything on the actor path, however, must match exactly -- a silently unloaded
-        # actor layer would produce plausible-looking but wrong labels for the entire run.
-        missing, unexpected = self.policy.load_state_dict(state_dict["model_state_dict"], strict=False)
+        # The teacher's critic is never used for distillation, and its observation group may not
+        # even exist in the distillation env, so a *shape* mismatch there is not an error --
+        # a privileged teacher whose value function additionally saw a height scan is the normal
+        # case, not an exotic one. `strict=False` alone does not cover this: it tolerates missing
+        # and unexpected keys but still raises on a size mismatch for a key that is present. So
+        # the mismatched critic tensors are dropped before loading.
+        #
+        # Everything on the actor path, by contrast, must match exactly -- a silently unloaded
+        # actor layer would produce plausible-looking but wrong labels for the entire run -- so
+        # shape mismatches there are collected and re-raised with the diagnostic below.
+        checkpoint_state = state_dict["model_state_dict"]
+        own_state = self.policy.state_dict()
+        loadable = {}
+        actor_mismatched = []
+        skipped_critic = []
+        for key, value in checkpoint_state.items():
+            if key in own_state and own_state[key].shape != value.shape:
+                detail = f"{key}: checkpoint {tuple(value.shape)} vs model {tuple(own_state[key].shape)}"
+                if _is_critic_key(key):
+                    skipped_critic.append(detail)
+                else:
+                    actor_mismatched.append(detail)
+                continue
+            loadable[key] = value
+
+        missing, unexpected = self.policy.load_state_dict(loadable, strict=False)
         actor_missing = [k for k in missing if not _is_critic_key(k)]
         actor_unexpected = [k for k in unexpected if not _is_critic_key(k)]
-        if actor_missing or actor_unexpected:
+        if actor_missing or actor_unexpected or actor_mismatched:
             raise RuntimeError(
                 "Teacher checkpoint does not match the configured teacher architecture on the actor"
-                f" path.\n  missing keys:    {actor_missing}\n  unexpected keys: {actor_unexpected}\n"
+                f" path.\n  missing keys:      {actor_missing}\n  unexpected keys:   {actor_unexpected}\n"
+                f"  shape mismatches:  {actor_mismatched}\n"
                 "Check `teacher_policy_class_name` and `teacher_policy` against the run that produced"
                 f" {model_path}."
+            )
+        if skipped_critic:
+            print(
+                "Distillation: ignoring the teacher's value function, whose observation group does not"
+                f" match this env ({len(skipped_critic)} tensor(s) skipped, e.g. {skipped_critic[0]})."
+                " Only the actor is used for labelling, so this is expected for a privileged teacher."
             )
 
         self._load_normalizer(state_dict)
@@ -198,10 +226,12 @@ class Distillation:
         gradient_length=24,
         normalize_accumulated_loss=True,
         flush_tail=True,
+        accumulate_gradients=False,
         learning_rate=3.0e-4,
         max_grad_norm=1.0,
         optimizer_class_name="Adam",
         freeze_action_std=True,
+        ema_decay=None,
         # -- recurrent bookkeeping
         refresh_hidden_after_update=False,
         # -- lr schedule
@@ -224,6 +254,21 @@ class Distillation:
             flush_tail: run a final optimizer step on the leftover steps when the rollout is not
                 an exact multiple of ``gradient_length``. Without it those steps produce no
                 gradient at all while still appearing in the logged loss.
+            accumulate_gradients: accumulate every TBPTT chunk's gradient and take a *single*
+                clipped optimizer step per rollout, instead of one step per chunk. Two effects
+                worth knowing:
+
+                * The weights no longer change during the replay, so the carry entering each
+                  chunk is produced by exactly the weights being trained -- the residual
+                  one-optimizer-step staleness described in the module docstring disappears,
+                  and ``refresh_hidden_after_update`` becomes pointless.
+                * ``max_grad_norm`` then clips the whole rollout's gradient rather than one
+                  chunk's, and the lr schedule advances once per iteration instead of
+                  ``ceil(T/G)`` times. Both change what a given hyper-parameter means, which is
+                  why this is opt-in rather than the default.
+            ema_decay: if set, maintain an exponential moving average of the student weights,
+                updated after every optimizer step, and checkpoint *those* as the deployable
+                model. ``None`` disables it. 0.997 gives roughly a 330-step averaging horizon.
             refresh_hidden_after_update: after all optimizer steps, replay the rollout once more
                 under ``no_grad`` with the final weights and use *that* as the next rollout's
                 carry. Costs one extra sequential forward pass over the rollout and only removes
@@ -244,6 +289,7 @@ class Distillation:
         self.gradient_length = gradient_length
         self.normalize_accumulated_loss = normalize_accumulated_loss
         self.flush_tail = flush_tail
+        self.accumulate_gradients = accumulate_gradients
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
         self.refresh_hidden_after_update = refresh_hidden_after_update
@@ -267,6 +313,16 @@ class Distillation:
             self.lr_scheduler = getattr(optim.lr_scheduler, lr_scheduler_class_name)(
                 self.optimizer, **(lr_scheduler or {})
             )
+
+        # Weight EMA. The shadow copy is keyed off the full state_dict rather than just the
+        # parameters so that any buffer a student carries survives a checkpoint round-trip;
+        # non-floating-point entries are copied rather than averaged.
+        if ema_decay is not None and not 0.0 < ema_decay < 1.0:
+            raise ValueError(f"ema_decay must be in (0, 1) or None, got {ema_decay!r}")
+        self.ema_decay = ema_decay
+        self._ema_state = None
+        if ema_decay is not None:
+            self._ema_state = {k: v.detach().clone() for k, v in self.actor_critic.state_dict().items()}
 
         # Teacher is built lazily in init_storage(), where the env's obs_format is available.
         self._teacher_cfg = dict(
@@ -381,19 +437,56 @@ class Distillation:
             raise ValueError(f"Unknown loss_type: {self.loss_type!r}")
         return per_env.mean()
 
-    def _optimize(self, chunk_losses):
-        """One optimizer step over an accumulated TBPTT chunk. Returns (norm_before, norm_after)."""
-        stacked = torch.stack(chunk_losses)
-        loss = stacked.mean() if self.normalize_accumulated_loss else stacked.sum()
+    def _chunk_plan(self):
+        """``(num_chunks, graded_steps)`` for the rollout currently in storage.
 
+        ``graded_steps`` counts only the steps that will actually produce a gradient, so a
+        dropped tail (``flush_tail=False``) does not dilute the accumulated loss.
+        """
+        total = len(self.storage)
+        full, tail = divmod(total, self.gradient_length)
+        if tail and self.flush_tail:
+            return full + 1, total
+        return full, full * self.gradient_length
+
+    def _chunk_loss(self, chunk_losses, graded_steps):
+        """Scalar loss for one TBPTT chunk, scaled for how it will be consumed.
+
+        Under accumulation the chunk losses are summed and divided by the rollout's *total*
+        graded step count, so that the gradient accumulated across all chunks equals the
+        gradient of the mean per-step loss over the whole rollout. Weighting by chunk length
+        rather than by ``1/num_chunks`` matters when a short tail chunk exists: dividing every
+        chunk equally would give a 5-step tail the same pull as an 80-step chunk.
+        """
+        stacked = torch.stack(chunk_losses)
+        if not self.normalize_accumulated_loss:
+            return stacked.sum()
+        if self.accumulate_gradients:
+            return stacked.sum() / max(graded_steps, 1)
+        return stacked.mean()
+
+    def _backward_chunk(self, chunk_losses, graded_steps):
+        """Backward one TBPTT chunk.
+
+        Returns ``(norm_before, norm_after)`` when this chunk also triggered an optimizer step,
+        or ``None`` when its gradient was merely accumulated for a single step taken at the end
+        of :meth:`update`.
+        """
+        loss = self._chunk_loss(chunk_losses, graded_steps)
+        if self.accumulate_gradients:
+            loss.backward()  # gradients pile up in .grad; zero_grad happened in update()
+            return None
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        return self._step()
 
+    def _step(self):
+        """Clip whatever is currently in ``.grad`` and take one optimizer step."""
         if dist.is_initialized():
             raise NotImplementedError(
                 "Distillation does not support distributed training yet. Gradients must be"
-                " all-reduced before *each* of the T/gradient_length optimizer steps in an update,"
-                " not once per update; see HANDOFF.md."
+                " all-reduced before *each* optimizer step in an update, not once per update;"
+                " see HANDOFF.md."
             )
 
         # clip_grad_norm_ returns the total norm *before* clipping, so both numbers come free.
@@ -403,11 +496,37 @@ class Distillation:
 
         self.optimizer.step()
         self.optimizer_step_count += 1
+        self._update_ema()
         if self.lr_scheduler is not None and self.lr_scheduler_step_unit == "optimizer_step":
             self.lr_scheduler.step()
             self.learning_rate = self.optimizer.param_groups[0]["lr"]
 
         return norm_before.detach(), norm_after.detach()
+
+    @torch.no_grad()
+    def _update_ema(self):
+        if self._ema_state is None:
+            return
+        decay = self.ema_decay
+        for key, value in self.actor_critic.state_dict().items():
+            shadow = self._ema_state[key]
+            if shadow.dtype.is_floating_point:
+                shadow.mul_(decay).add_(value.detach(), alpha=1.0 - decay)
+            else:
+                shadow.copy_(value)  # e.g. integer counters -- averaging them is meaningless
+
+    def load_ema_into_model(self):
+        """Overwrite the live student with its EMA weights.
+
+        Checkpoints already store the EMA weights as ``model_state_dict``, but ``export_as_jit``
+        / ``export_as_onnx`` trace ``alg.actor_critic`` directly. Call this before exporting (or
+        before an eval rollout) if you want the exported artefact to match the checkpoint.
+        Training should not continue afterwards -- the optimizer state belongs to the raw
+        weights, not the averaged ones.
+        """
+        if self._ema_state is None:
+            raise RuntimeError("No EMA is being maintained; construct Distillation with ema_decay.")
+        self.actor_critic.load_state_dict(self._ema_state)
 
     def update(self, current_learning_iteration):
         self.current_learning_iteration = current_learning_iteration
@@ -416,6 +535,8 @@ class Distillation:
         # Replay from where the rollout began, not from where it ended: the point is to
         # regenerate the carry with the weights being trained.
         policy.set_actor_hidden_state(self._rollout_start_hidden)
+
+        _, graded_steps = self._chunk_plan()
 
         zero = torch.zeros((), device=self.device)
         behavior_loss_sum = zero.clone()
@@ -427,6 +548,10 @@ class Distillation:
         optimizer_steps = 0
         tail_chunk_size = 0
         chunk_losses = []
+
+        if self.accumulate_gradients:
+            # One zeroing for the whole rollout: every chunk below adds into .grad.
+            self.optimizer.zero_grad(set_to_none=True)
 
         for student_obs, teacher_mean, dones in self.storage.iter_timesteps():
             student_mean = policy.act_inference(student_obs)
@@ -441,13 +566,15 @@ class Distillation:
                 action_err_max = torch.maximum(action_err_max, diff.abs().max())
 
             if len(chunk_losses) == self.gradient_length:
-                norm_before, norm_after = self._optimize(chunk_losses)
-                norm_before_sum += norm_before
-                norm_after_sum += norm_after
-                optimizer_steps += 1
+                stepped = self._backward_chunk(chunk_losses, graded_steps)
+                if stepped is not None:
+                    norm_before_sum += stepped[0]
+                    norm_after_sum += stepped[1]
+                    optimizer_steps += 1
                 chunk_losses = []
                 # backward() freed the graph the carry still points into; cut it before the
-                # next chunk starts recomputing from here.
+                # next chunk starts recomputing from here. Required under accumulation too --
+                # only the gradients persist across chunks, never the graph.
                 policy.detach_actor_hidden_state()
 
             # Ordering mirrors the rollout exactly: act on obs[t], then apply dones[t]. Masking
@@ -456,12 +583,20 @@ class Distillation:
 
         if chunk_losses and self.flush_tail:
             tail_chunk_size = len(chunk_losses)
-            norm_before, norm_after = self._optimize(chunk_losses)
+            stepped = self._backward_chunk(chunk_losses, graded_steps)
+            if stepped is not None:
+                norm_before_sum += stepped[0]
+                norm_after_sum += stepped[1]
+                optimizer_steps += 1
+            policy.detach_actor_hidden_state()
+        chunk_losses = []
+
+        if self.accumulate_gradients and num_steps > 0:
+            # The single step of the rollout, over gradients accumulated from every chunk.
+            norm_before, norm_after = self._step()
             norm_before_sum += norm_before
             norm_after_sum += norm_after
             optimizer_steps += 1
-            policy.detach_actor_hidden_state()
-        chunk_losses = []
 
         policy.detach_actor_hidden_state()
 
@@ -531,12 +666,25 @@ class Distillation:
             "model_state_dict": self.actor_critic.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
+        if self._ema_state is not None:
+            # The EMA weights are the deployable ones, so they take the `model_state_dict` slot
+            # that OnPolicyRunner and the exporters read. The raw weights ride along under a
+            # separate key purely so training can resume where it left off -- resuming from an
+            # average, with an optimizer state that belongs to the raw weights, would not.
+            state_dict["model_state_dict"] = {k: v.clone() for k, v in self._ema_state.items()}
+            state_dict["raw_model_state_dict"] = self.actor_critic.state_dict()
         if self.lr_scheduler is not None:
             state_dict["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
         return state_dict
 
     def load_state_dict(self, state_dict):
-        self.actor_critic.load_state_dict(state_dict["model_state_dict"])
+        # A checkpoint written with EMA on carries both; prefer the raw weights so that a
+        # resumed run continues the trajectory the optimizer state describes.
+        weights = state_dict.get("raw_model_state_dict", state_dict["model_state_dict"])
+        self.actor_critic.load_state_dict(weights)
+        if self._ema_state is not None:
+            source = state_dict["model_state_dict"] if "raw_model_state_dict" in state_dict else weights
+            self._ema_state = {k: v.detach().clone().to(self.device) for k, v in source.items()}
         if "optimizer_state_dict" in state_dict:
             self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
         if self.lr_scheduler is not None and "lr_scheduler_state_dict" in state_dict:
