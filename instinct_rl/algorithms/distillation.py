@@ -248,6 +248,7 @@ class Distillation:
         teacher_policy=None,
         teacher_obs_source="critic",
         allow_random_teacher=False,
+        warm_start_from_teacher=False,
         # -- loss
         loss_type="mse_sum",
         # -- optimisation
@@ -274,6 +275,24 @@ class Distillation:
             teacher_obs_source: which observation group of the *current* env feeds the teacher's
                 actor. "critic" for the usual privileged-teacher setup, "policy" when teacher and
                 student share an observation space.
+            warm_start_from_teacher: copy every teacher weight the student can accept -- memory,
+                actor head, MoE gate -- leaving only the exteroceptive encoder (``encoders.*``)
+                and the action std randomly initialized.
+
+                This only applies when teacher and student are architecturally identical apart
+                from that encoder, which is the setup *Now You See That* describes: "the teacher
+                and student policies share identical architectures except for their exteroceptive
+                encoders ... the depth encoder output replaces the height scan embedding".
+
+                It changes what the run is learning. Cold-started, the student must rediscover
+                locomotion from a state distribution consisting entirely of falling, because a
+                student-only rollout never produces anything else until it can walk. Warm-started,
+                the locomotion policy is already there and the only thing being learned is a
+                depth encoder that produces latents the inherited network can already use --
+                which is also why no explicit teacher/student latent-matching loss is needed:
+                the action loss forces that alignment through the frozen-in-place downstream net.
+
+                Nothing is frozen, so the inherited weights still adapt.
             gradient_length: TBPTT chunk length, in environment steps. Decoupled from
                 ``num_steps_per_env`` on purpose: the rollout length sets how much data an
                 iteration sees, this sets how deep gradients flow.
@@ -336,6 +355,7 @@ class Distillation:
         self.actor_critic.to(self.device)
 
         self.teacher_obs_source = teacher_obs_source
+        self.warm_start_from_teacher = warm_start_from_teacher
         if teacher_obs_source not in ("policy", "critic"):
             raise ValueError(f"teacher_obs_source must be 'policy' or 'critic', got {teacher_obs_source!r}")
 
@@ -436,6 +456,66 @@ class Distillation:
             device=self.device,
             **teacher_cfg,
         )
+
+        if self.warm_start_from_teacher:
+            self._warm_start()
+
+    # Weights the student must learn for itself rather than inherit: the exteroceptive encoder
+    # is the whole point of the distillation (a different sensor modality entirely), and the
+    # action std is a deliberate config choice -- the teacher explores at 1.0, the student is
+    # meant to stay at its own constant (0.1 in the paper).
+    _WARM_START_EXCLUDE = ("encoders.", "std")
+
+    def _warm_start(self):
+        """Seed the student with every teacher weight it can accept. See ``warm_start_from_teacher``."""
+        teacher_state = self.teacher.policy.state_dict()
+        student_state = self.actor_critic.state_dict()
+
+        to_load, inherited, excluded, incompatible = {}, [], [], []
+        for key, value in student_state.items():
+            if key.startswith(self._WARM_START_EXCLUDE):
+                excluded.append(key)
+            elif key not in teacher_state or teacher_state[key].shape != value.shape:
+                incompatible.append(key)
+            else:
+                to_load[key] = teacher_state[key]
+                inherited.append(key)
+
+        # The locomotion policy *is* the memory plus the actor head. If any of it failed to
+        # transfer, the warm start did not do the one thing it exists to do -- and the run would
+        # continue from a half-seeded network while the log claims it was warm-started, which is
+        # worse than not offering the option at all. Encoder and critic gaps are expected and fine.
+        critical = sorted({k for k in incompatible if k.startswith(("memory_a.", "actor."))})
+        if critical or not inherited:
+            raise RuntimeError(
+                "warm_start_from_teacher could not transfer the student's locomotion policy:"
+                f" {len(critical)} actor/memory tensor(s) are absent from the teacher or a"
+                f" different shape, e.g. {critical[:4]}.\n"
+                "This option assumes teacher and student are identical apart from the"
+                " exteroceptive encoder. Check rnn_hidden_size / rnn_num_layers /"
+                " actor_hidden_dims / num_moe_experts / moe_gate_hidden_dims against the teacher,"
+                " and that both encoders emit the same latent width (the GRU input is"
+                " proprio + latent, so a differing latent size shifts every recurrent weight)."
+            )
+
+        self.actor_critic.load_state_dict(to_load, strict=False)
+
+        def _modules(keys):
+            return sorted({k.split(".")[0] for k in keys})
+
+        print(
+            f"Distillation: warm-started the student from the teacher -- inherited"
+            f" {len(inherited)} tensors {_modules(inherited)}, left {len(excluded)} to be learned"
+            f" {_modules(excluded)}."
+        )
+        if incompatible:
+            print(
+                "\033[43;33mDistillation warning: warm start could not transfer"
+                f" {len(incompatible)} tensor(s) {_modules(incompatible)} -- absent from the"
+                " teacher or a different shape. The student is only partly seeded; if this list"
+                " is not what you expect, teacher and student are not as architecturally aligned"
+                " as warm_start_from_teacher assumes.\033[0m"
+            )
 
     """
     Rollout
