@@ -447,6 +447,8 @@ class Distillation:
                 )
             group = obs_format[self.teacher_obs_source]
             policy_cfg["obs_format"] = {"policy": group, "critic": group}
+        else:
+            self._check_teacher_obs_matches_env(obs_format, policy_cfg["obs_format"])
 
         self.teacher = TeacherPolicy(
             policy_cfg=policy_cfg,
@@ -459,6 +461,47 @@ class Distillation:
 
         if self.warm_start_from_teacher:
             self._warm_start()
+
+    def _check_teacher_obs_matches_env(self, env_obs_format, teacher_obs_format):
+        """Verify the env group feeding the teacher matches the layout the teacher was built for.
+
+        Only reachable when `teacher_policy.obs_format` is given explicitly. The teacher is then
+        built from that declaration, not from the env, so the two can disagree -- and nothing
+        downstream notices. `ParallelLayer` slices the incoming tensor by the *declared* segment
+        sizes, so a longer observation is silently truncated and a shorter one silently
+        reinterprets neighbouring components. The teacher goes on producing confident,
+        meaningless labels and the student faithfully imitates them.
+
+        Observed once: the env's `critic` group was changed to history-stacked observations
+        (proprio x8, height scan x4 -> 3540 dims) while the teacher was still declared on the
+        single-frame layout (789 dims). The run trained for 8.3 hours; every episode ended in
+        base contact within ~15 steps and the terrain curriculum never left level 0.
+        """
+        group = env_obs_format.get(self.teacher_obs_source)
+        if group is None:
+            raise KeyError(
+                f"teacher_obs_source={self.teacher_obs_source!r} is not an observation group of this"
+                f" env (available: {list(env_obs_format)})."
+            )
+        declared = teacher_obs_format["policy"]
+        env_size, declared_size = int(get_subobs_size(group)), int(get_subobs_size(declared))
+        if env_size == declared_size:
+            return
+
+        def _terms(fmt):
+            return "\n".join(f"      {k:24s} {tuple(v)}" for k, v in fmt.items())
+
+        raise ValueError(
+            f"The env's '{self.teacher_obs_source}' observation group is {env_size} values, but"
+            f" `teacher_policy.obs_format['policy']` declares {declared_size}. That group is what"
+            " feeds the teacher, so the mismatch would be silently sliced rather than raised, and"
+            " every action label would be meaningless.\n"
+            f"  env['{self.teacher_obs_source}'] ({env_size}):\n{_terms(group)}\n"
+            f"  teacher_policy.obs_format['policy'] ({declared_size}):\n{_terms(declared)}\n"
+            "Usually one side gained or lost observation history (a term's `history_length`), or"
+            " a term was renamed. Make the env group match the layout the teacher was trained on,"
+            " or drop `teacher_policy.obs_format` entirely to derive it from the env."
+        )
 
     # Weights the student must learn for itself rather than inherit: the exteroceptive encoder
     # is the whole point of the distillation (a different sensor modality entirely), and the
