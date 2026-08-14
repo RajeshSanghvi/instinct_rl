@@ -196,6 +196,7 @@ algorithm:
 
   accumulate_gradients: false             # see below
   ema_decay: null                         # e.g. 0.997
+  warm_start_from_teacher: false          # see below -- large effect when applicable
 
   refresh_hidden_after_update: false
 
@@ -263,6 +264,28 @@ with alg.use_student_weights("ema"):
 It restores on exit (including on exception), so it is safe mid-training — leaving the average
 installed would corrupt the next step, since the optimizer state belongs to the raw weights.
 
+**The env group feeding the teacher must match the layout the teacher was built for.** When
+`teacher_policy.obs_format` is given explicitly, the teacher is built from *that* declaration
+rather than from the env, so the two can silently disagree: `ParallelLayer` slices the incoming
+tensor by the declared segment sizes, so a longer observation is truncated and a shorter one
+reinterprets neighbouring components. The teacher keeps producing confident, meaningless labels.
+
+This happened. The env's `critic` group was switched to history-stacked observations (proprio
+x8, height scan x4 = **3540** values) while the teacher was still declared on the single-frame
+layout (**789**). The run trained for **8.3 hours**: initial behaviour loss 72.9 against the
+warm-started 5.9, every episode ending in base contact within ~15 steps (`base_contact` 0.80-0.99,
+`time_out` exactly 0), and `terrain_levels` pinned at 0 from iteration 100 onward. Nothing raised.
+
+`init_storage` now compares the two and refuses, printing both layouts term by term so the
+offending observation is obvious. Dropping `teacher_policy.obs_format` entirely also avoids the
+class of bug, since the teacher is then built from the env group by construction.
+
+> A related invariant in the env config, easy to undo: the group feeding the teacher must stay
+> **uncorrupted**. `StudentObservationsCfg.CriticCfg` carries a comment saying its noise is
+> intentionally omitted because the teacher checkpoint was trained without it. The same run above
+> also flipped `enable_corruption` to `True` there. That is the asymmetry of the paper's Eq. 8 —
+> the student receives noisy proprioception, the teacher clean.
+
 **Fail-fast configuration.** Three misconfigurations used to produce a healthy-looking loss curve
 and a wrong result; all three now raise at construction:
 
@@ -278,6 +301,50 @@ and a wrong result; all three now raise at construction:
 
 `gradient_length`, `learning_rate` and `max_grad_norm` are range-checked too. `learning_rate: 0`
 stays legal — it freezes the weights while still populating `.grad`.
+
+**`warm_start_from_teacher`.** Off by default. On, every teacher weight the student can accept is
+copied in — memory, actor head, MoE gate — leaving only the exteroceptive encoder (`encoders.*`)
+and the action std randomly initialized. Nothing is frozen; the inherited weights still train.
+
+It only applies when teacher and student are identical apart from that encoder, which is the
+setup *Now You See That* describes ("the teacher and student policies share identical
+architectures except for their exteroceptive encoders … the depth encoder output replaces the
+height scan embedding"). The check is that both encoders emit the same latent width, since the
+GRU input is `proprio + latent` — a differing latent size shifts every recurrent weight. If any
+`memory_a.*` or `actor.*` tensor fails to transfer, construction raises rather than training on
+from a half-seeded network that the log claims was warm-started.
+
+**Measured on the parkour G1 task**, teacher and student both `EncoderMoEActorCriticRecurrent`
+(GRU 256, actor `[512, 256, 128]`, 4 MoE experts, 128-wide latent):
+
+| | cold start, **465 iterations** | warm start, **20 iterations** |
+| --- | --- | --- |
+| `Episode/Curriculum/terrain_levels` | 0.0000 | **5.45** |
+| `Train/mean_episode_length` | 69 steps | **800 steps** |
+| `Loss/behavior` | 14.31 | **1.16** |
+| `Episode_Termination/time_out` | 0.0000 | dominant |
+
+Cold-started, *every* episode ended in `bad_orientation` (67%) or `root_height` (34%) — a
+student-only rollout from random weights produces nothing but falling, so the only states it ever
+labels are states the teacher would never visit. Warm-started, `mean_episode_length` was already
+746 at **iteration 0**, before a single gradient step.
+
+> **Warm start changes what the learning rate should be.** The inherited policy is already near
+> optimal, so One Cycle's premise — a large ramp for from-scratch super-convergence — no longer
+> holds. On the run above, `max_lr: 1e-2` degraded the policy *during the ramp*, at an actual lr
+> of only ~2e-3: between iterations 40 and 67 the behaviour loss went 0.797 → 2.183, mean episode
+> length 880 → 477, terrain level 5.03 → 3.65 and `root_height` terminations 0.086 → 0.296. The
+> damage threshold sat somewhere around 1.5–2e-3, i.e. a fifth of the configured peak. Start an
+> order of magnitude lower (`max_lr: 1e-3`) and keep `save_interval` small enough to retain the
+> best checkpoint.
+>
+> A second, warm-start-specific mechanism to be aware of: the inherited GRU was trained on the
+> *teacher's* height-scan latent distribution, while the student's depth encoder starts random
+> and its output distribution keeps moving as it learns — the downstream network is standing on
+> ground that shifts under it. This is a concrete reason for the paper's `L_kl` (pin the encoder's
+> batch-wise output distribution to `N(0, I)`) beyond "prevent representation collapse". If a low
+> lr is not enough, freezing everything but the encoder for the first iterations is the standard
+> remedy and directly targets this.
 
 **Normalizer ownership.** The teacher normalizes its own observations using the normalizer stored
 in its checkpoint. Do **not** configure `normalizers.critic` (or whichever group
@@ -365,9 +432,12 @@ its normalizer and every logged statistic are allocated on `self.device`, and
 configure. What is worth knowing:
 
 **`gradient_length` is the memory knob, not `num_envs`.** Peak activation memory during
-`update()` scales as `gradient_length x num_envs x per_step_activation_size` — the whole chunk's
-graph is retained until its `backward()`. If you OOM, halve `gradient_length` before touching
-`num_envs`; it costs you BPTT depth but leaves the data throughput intact.
+`update()` scales as `gradient_length x (num_envs / num_env_minibatches) x
+per_step_activation_size` — the whole chunk's graph is retained until its `backward()`.
+
+> An earlier version of this file said "if you OOM, halve `gradient_length` before touching
+> `num_envs`". That was the wrong advice: it spends the BPTT depth this module exists to provide.
+> Raise `num_env_minibatches` instead (§4) — it is exact, and costs only speed.
 
 **Storage is lighter than PPO's.** `DistillationStorage` keeps student observations, teacher
 action means and dones. It does *not* keep the privileged/critic observations — the teacher is
@@ -381,6 +451,48 @@ launch is small, so the GPU is often idle between them. If `Perf/learning_time` 
 expected, that is why — measure before optimising, and measure with `torch.cuda.synchronize()`
 around the region or the number will be meaningless. `_refresh_hidden` already synchronises
 internally for exactly this reason.
+
+**`num_env_minibatches` is how you raise `num_envs`.** Peak activation memory during `update()`
+is `gradient_length x num_envs x per_step_activation`, and the replay used to hold all
+environments at once, so the only way to fit more of them was to shorten the BPTT window. That
+is a bad trade — the BPTT machinery is the reason this module exists. Splitting the *environment*
+dimension instead costs nothing semantically: environments are independent (each owns its RNN
+carry, and no operator in the student mixes across the batch), so the accumulated gradient equals
+the unsplit one to numerical precision. `tests/test_distillation_env_minibatch.py` pins that
+equality for GRU and LSTM carries, uneven slices, tail chunks and the refresh pass.
+
+Measured on the parkour G1 task (31 GB card, `G=80`): ~10.4 MB per environment, of which ~6.4 MB
+is `gradient_length`-proportional activation and ~4 MB is simulation. `k=4` therefore buys
+roughly 4x the environments at the same BPTT depth. The cost is speed — k sequential passes over
+`num_envs / k` environments launch smaller kernels.
+
+**Why more environments matter here, even though the terrain curriculum saturates at level 6.0
+for every value tried (768, 1024, 4096).** Most of this env's domain randomization is
+`mode="startup"`: friction, restitution, body mass, COM offset, actuator gains and joint armature
+are each sampled **once per environment for the entire run**. The number of distinct dynamics the
+policy ever experiences is exactly `num_envs`, and training longer does not add one. That is a
+sim-to-real coverage property, invisible to every training metric — which is why the saturated
+curriculum is not evidence against raising it.
+
+Requires `accumulate_gradients: true`; stepping inside a slice would let later slices
+differentiate at weights the earlier ones moved, which is what the exactness rests on.
+
+**`num_steps_per_env` is a latency knob, not a throughput one.** Collection dominates: on the
+parkour G1 task at `num_envs: 1024` it is ~85 ms per environment step (physics + depth render +
+the 693-ray height scan the teacher needs), so `T=800` costs ~68 s of collection against ~4 s of
+learning — 94 % of the iteration, and no log line until all of it finishes.
+
+With `accumulate_gradients: false`, `T` does **not** change the optimizer-step rate: a rollout
+yields `ceil(T/G)` steps and takes time proportional to `T`, so steps-per-second is `1/(G x
+per-step-cost)` either way. Nor does it change the effective batch, which is `G x num_envs` per
+step. What shrinking `T` toward `G` buys is feedback latency, checkpoint granularity, and less
+storage; what it costs is nothing, with one thing in its favour: at `T=G` every chunk is trained
+on data the *current* weights collected, whereas at `T=10G` nine tenths of each rollout was
+collected by weights up to nine optimizer steps older — which is off-policy for a DAgger method
+whose whole premise is the student's own current state distribution.
+
+Getting below `T=G` requires cutting `G` (BPTT depth) or `num_envs`, both of which do cost
+something.
 
 **Per-timestep host syncs are avoided.** All in-loop statistics accumulate as device tensors;
 nothing calls `.item()` until `update()` returns. Keep it that way — a `.item()` inside the
@@ -524,6 +636,10 @@ Only after the smoke run looks sane: full run at `num_steps_per_env: 48`, `gradi
 - **`TeacherPolicy` normalizer lookup is hard-coded to the `policy` group** of the teacher's
   `params/agent.yaml`, matching `TPPO`. A teacher trained with a differently-named group will
   need a small change in `_load_normalizer`.
+- ~~**The replay holds every environment at once**~~ — closed by `num_env_minibatches` (§4).
+  Peak activation is now `gradient_length x (num_envs / k)`, so `num_envs` is no longer bounded
+  by BPTT depth. Note the earlier advice in §5b — "if you OOM, halve `gradient_length`" — was
+  wrong, and is the remedy this option replaces.
 - ~~**No test covers `DistillationRunner`**~~ — closed. `tests/test_distillation_integration.py`
   defines a `StubVecEnv` and drives the real `OnPolicyRunner.learn()` loop, so all three runner
   guards, the rollout under `torch.inference_mode`, checkpointing and resume are exercised. That

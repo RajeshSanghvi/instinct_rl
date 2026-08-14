@@ -39,6 +39,7 @@ import torch.optim as optim
 import yaml
 
 import instinct_rl.modules as modules
+from instinct_rl.modules.actor_critic_recurrent import map_hidden_state
 from instinct_rl.storage.distillation_storage import DistillationStorage
 from instinct_rl.utils.utils import get_subobs_size
 
@@ -256,6 +257,7 @@ class Distillation:
         normalize_accumulated_loss=True,
         flush_tail=True,
         accumulate_gradients=False,
+        num_env_minibatches=1,
         learning_rate=3.0e-4,
         max_grad_norm=1.0,
         optimizer_class_name="Adam",
@@ -318,6 +320,30 @@ class Distillation:
                   chunk's, and the lr schedule advances once per iteration instead of
                   ``ceil(T/G)`` times. Both change what a given hyper-parameter means, which is
                   why this is opt-in rather than the default.
+            num_env_minibatches: split the replay across this many contiguous slices of the
+                environment dimension, accumulating each slice's gradient. Peak activation memory
+                becomes ``gradient_length x (num_envs / k) x per_step_activation``, so ``k=4``
+                quadruples the environments that fit **without touching BPTT depth**.
+
+                Unlike shortening ``gradient_length`` -- the other way to cut activation memory --
+                this is mathematically exact: environments are independent (each carries its own
+                RNN state, and no operator in the student mixes across the batch), so the
+                accumulated gradient equals the unsplit one to numerical precision. Shortening
+                the BPTT window instead genuinely discards gradient. There is a test pinning the
+                equality.
+
+                The cost is speed: k sequential passes over 1/k of the environments each launch
+                smaller kernels, so expect a modest slowdown for the same total work.
+
+                Why bother, when more environments do not raise the terrain curriculum: most
+                domain randomization here is `mode="startup"` (friction, restitution, body mass,
+                COM, actuator gains, armature), sampled **once per environment for the whole
+                run**. The number of distinct dynamics the policy ever sees is exactly
+                ``num_envs`` -- training longer does not add one. Coverage of that space is a
+                sim-to-real property no training metric shows.
+
+                Requires ``accumulate_gradients=True``: stepping inside a slice would let later
+                slices see weights the earlier ones moved, which is what the exactness rests on.
             ema_decay: if set, maintain an exponential moving average of the student weights,
                 updated after every optimizer step, and checkpoint *those* as the deployable
                 model. ``None`` disables it. 0.997 gives roughly a 330-step averaging horizon.
@@ -364,6 +390,17 @@ class Distillation:
         self.normalize_accumulated_loss = normalize_accumulated_loss
         self.flush_tail = flush_tail
         self.accumulate_gradients = accumulate_gradients
+        if not (isinstance(num_env_minibatches, int) and num_env_minibatches > 0):
+            raise ValueError(
+                f"num_env_minibatches must be a positive integer, got {num_env_minibatches!r}"
+            )
+        if num_env_minibatches > 1 and not accumulate_gradients:
+            raise ValueError(
+                "num_env_minibatches > 1 requires accumulate_gradients=True. Taking an optimizer"
+                " step inside a slice would let later slices differentiate at weights the earlier"
+                " ones already moved, which is exactly the equivalence this option depends on."
+            )
+        self.num_env_minibatches = num_env_minibatches
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
         self.refresh_hidden_after_update = refresh_hidden_after_update
@@ -606,8 +643,13 @@ class Distillation:
     Update
     """
 
-    def _behavior_loss(self, student_mean, teacher_mean):
-        """Per-timestep behaviour loss: reduce over the action dimension, mean over envs."""
+    def _behavior_loss(self, student_mean, teacher_mean, num_envs_total=None):
+        """Per-timestep behaviour loss: reduce over the action dimension, mean over envs.
+
+        ``num_envs_total`` divides by the *rollout's* environment count rather than this batch's,
+        so that summing the result over environment slices reproduces the unsplit mean exactly.
+        Left as None (the default) it is the plain mean over whatever was passed.
+        """
         diff = student_mean - teacher_mean
         if self.loss_type == "mse_sum":
             per_env = diff.square().sum(dim=-1)
@@ -619,7 +661,32 @@ class Distillation:
             per_env = F.huber_loss(student_mean, teacher_mean, reduction="none").sum(dim=-1)
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type!r}")
-        return per_env.mean()
+        if num_envs_total is None:
+            return per_env.mean()
+        return per_env.sum() / num_envs_total
+
+    def _env_slices(self):
+        """Contiguous environment-dimension slices for the replay; one slice when k == 1."""
+        num_envs = self.storage.num_envs
+        k = min(self.num_env_minibatches, num_envs)
+        edges = [round(i * num_envs / k) for i in range(k + 1)]
+        return [slice(edges[i], edges[i + 1]) for i in range(k)]
+
+    @staticmethod
+    def _slice_hidden(hidden_state, env_slice):
+        """Take one environment slice of a carry. Environments live on dim 1 of ``(L, N, H)``."""
+        return map_hidden_state(hidden_state, lambda t: t[:, env_slice].contiguous())
+
+    @staticmethod
+    def _concat_hidden(parts):
+        """Stitch per-slice carries back into one, preserving the container type."""
+        if not parts or any(p is None for p in parts):
+            return None
+        first = parts[0]
+        if torch.is_tensor(first):
+            return torch.cat(parts, dim=1)
+        fields = [Distillation._concat_hidden([tuple(p)[i] for p in parts]) for i in range(len(tuple(first)))]
+        return tuple(fields) if type(first) is tuple else type(first)(*fields)
 
     def _chunk_plan(self):
         """``(num_chunks, graded_steps)`` for the rollout currently in storage.
@@ -742,11 +809,8 @@ class Distillation:
         self.current_learning_iteration = current_learning_iteration
         policy = self.actor_critic
 
-        # Replay from where the rollout began, not from where it ended: the point is to
-        # regenerate the carry with the weights being trained.
-        policy.set_actor_hidden_state(self._rollout_start_hidden)
-
         _, graded_steps = self._chunk_plan()
+        total_envs = self.storage.num_envs
 
         zero = torch.zeros((), device=self.device)
         behavior_loss_sum = zero.clone()
@@ -763,43 +827,61 @@ class Distillation:
             # One zeroing for the whole rollout: every chunk below adds into .grad.
             self.optimizer.zero_grad(set_to_none=True)
 
-        for student_obs, teacher_mean, dones in self.storage.iter_timesteps():
-            student_mean = policy.act_inference(student_obs)
-            step_loss = self._behavior_loss(student_mean, teacher_mean)
-            chunk_losses.append(step_loss)
-            num_steps += 1
+        # Environments are independent -- each owns its RNN carry and nothing in the student
+        # mixes across the batch -- so replaying them in slices and accumulating is exact. The
+        # losses are divided by `total_envs` rather than the slice size for the same reason.
+        end_carries = []
+        for slice_index, env_slice in enumerate(self._env_slices()):
+            # Replay from where the rollout began, not from where it ended: the point is to
+            # regenerate the carry with the weights being trained.
+            policy.set_actor_hidden_state(self._slice_hidden(self._rollout_start_hidden, env_slice))
+            chunk_losses = []
 
-            with torch.no_grad():
-                diff = student_mean - teacher_mean
-                behavior_loss_sum += step_loss.detach()
-                action_l2_sum += diff.norm(dim=-1).mean()
-                action_err_max = torch.maximum(action_err_max, diff.abs().max())
+            for student_obs, teacher_mean, dones in self.storage.iter_timesteps():
+                student_obs, teacher_mean, dones = (
+                    student_obs[env_slice],
+                    teacher_mean[env_slice],
+                    dones[env_slice],
+                )
+                student_mean = policy.act_inference(student_obs)
+                step_loss = self._behavior_loss(student_mean, teacher_mean, num_envs_total=total_envs)
+                chunk_losses.append(step_loss)
+                if slice_index == 0:
+                    num_steps += 1  # timesteps are replayed once per slice; count them once
 
-            if len(chunk_losses) == self.gradient_length:
+                with torch.no_grad():
+                    diff = student_mean - teacher_mean
+                    behavior_loss_sum += step_loss.detach()
+                    action_l2_sum += diff.norm(dim=-1).sum() / total_envs
+                    action_err_max = torch.maximum(action_err_max, diff.abs().max())
+
+                if len(chunk_losses) == self.gradient_length:
+                    stepped = self._backward_chunk(chunk_losses, graded_steps)
+                    if stepped is not None:
+                        norm_before_sum += stepped[0]
+                        norm_after_sum += stepped[1]
+                        optimizer_steps += 1
+                    chunk_losses = []
+                    # backward() freed the graph the carry still points into; cut it before the
+                    # next chunk starts recomputing from here. Required under accumulation too --
+                    # only the gradients persist across chunks, never the graph.
+                    policy.detach_actor_hidden_state()
+
+                # Ordering mirrors the rollout exactly: act on obs[t], then apply dones[t].
+                # Masking (not reset()) keeps the graph alive for envs that did not terminate.
+                policy.mask_actor_hidden_state(dones)
+
+            if chunk_losses and self.flush_tail:
+                tail_chunk_size = len(chunk_losses)
                 stepped = self._backward_chunk(chunk_losses, graded_steps)
                 if stepped is not None:
                     norm_before_sum += stepped[0]
                     norm_after_sum += stepped[1]
                     optimizer_steps += 1
-                chunk_losses = []
-                # backward() freed the graph the carry still points into; cut it before the
-                # next chunk starts recomputing from here. Required under accumulation too --
-                # only the gradients persist across chunks, never the graph.
                 policy.detach_actor_hidden_state()
 
-            # Ordering mirrors the rollout exactly: act on obs[t], then apply dones[t]. Masking
-            # (not reset()) keeps the graph alive for the environments that did not terminate.
-            policy.mask_actor_hidden_state(dones)
-
-        if chunk_losses and self.flush_tail:
-            tail_chunk_size = len(chunk_losses)
-            stepped = self._backward_chunk(chunk_losses, graded_steps)
-            if stepped is not None:
-                norm_before_sum += stepped[0]
-                norm_after_sum += stepped[1]
-                optimizer_steps += 1
             policy.detach_actor_hidden_state()
-        chunk_losses = []
+            end_carries.append(policy.get_actor_hidden_state())
 
         if self.accumulate_gradients and num_steps > 0:
             # The single step of the rollout, over gradients accumulated from every chunk.
@@ -808,7 +890,8 @@ class Distillation:
             norm_after_sum += norm_after
             optimizer_steps += 1
 
-        policy.detach_actor_hidden_state()
+        # Stitch the slices' end carries back into one before anything reads it again.
+        policy.set_actor_hidden_state(self._concat_hidden(end_carries))
 
         refresh_time = 0.0
         if self.refresh_hidden_after_update:
@@ -855,10 +938,16 @@ class Distillation:
 
         policy = self.actor_critic
         with torch.no_grad():
-            policy.set_actor_hidden_state(self._rollout_start_hidden)
-            for student_obs, _, dones in self.storage.iter_timesteps():
-                policy.act_inference(student_obs)
-                policy.mask_actor_hidden_state(dones)
+            # Sliced the same way as the replay: no graph is built here, but a full-width pass
+            # would still need the whole rollout's activations resident at once.
+            end_carries = []
+            for env_slice in self._env_slices():
+                policy.set_actor_hidden_state(self._slice_hidden(self._rollout_start_hidden, env_slice))
+                for student_obs, _, dones in self.storage.iter_timesteps():
+                    policy.act_inference(student_obs[env_slice])
+                    policy.mask_actor_hidden_state(dones[env_slice])
+                end_carries.append(policy.get_actor_hidden_state())
+            policy.set_actor_hidden_state(self._concat_hidden(end_carries))
 
         if cuda:
             torch.cuda.synchronize(self.device)
