@@ -11,6 +11,7 @@ from .all_mixer import (
     EncoderVaeActorCritic,
     MoEActorCriticRecurrent,
 )
+from .ame_attention import AMEHeightmapAttentionHeadModel
 from .cross_attention import CrossAttnFuseHeadModel
 from .discriminator import Discriminator, MultiDiscriminator
 from .encoder_actor_critic import EncoderActorCritic, EncoderActorCriticRecurrent

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from instinct_rl.modules.ame_attention import AMEHeightmapAttentionHeadModel
 from instinct_rl.modules.conv2d import Conv2dHeadModel
 from instinct_rl.modules.cross_attention import CrossAttnFuseHeadModel
 from instinct_rl.modules.mlp import MlpModel
@@ -16,6 +17,13 @@ from instinct_rl.utils.utils import (
     get_subobs_size,
     module_is_from_type,
 )
+
+
+_CROSS_ATTN_MODEL_CLASSES = {
+    "CrossAttnFuseHeadModel": CrossAttnFuseHeadModel,
+    "AMEHeightmapAttentionHeadModel": AMEHeightmapAttentionHeadModel,
+}
+_CROSS_ATTN_BLOCK_TYPES = tuple(_CROSS_ATTN_MODEL_CLASSES.values())
 
 
 class ParallelLayer(nn.Module):
@@ -94,14 +102,14 @@ class ParallelLayer(nn.Module):
                 output_size=output_size,
                 **model_kwargs,
             )
-        elif model_class_name == "CrossAttnFuseHeadModel":
-            assert len(input_component_shapes) == 1, "CrossAttnFuseHeadModel only accepts one image component"
+        elif model_class_name in _CROSS_ATTN_MODEL_CLASSES:
+            assert len(input_component_shapes) == 1, "Cross-attention blocks accept exactly one image component"
             # proprioceptive components that form the cross-attention query.
             # They are NOT taken out of the obs (only the image component is), so
             # they still flow to the downstream network.
             info_component_names = model_kwargs.pop("info_component_names")
             info_dim = int(sum(np.prod(input_segments[name]) for name in info_component_names))
-            model = CrossAttnFuseHeadModel(
+            model = _CROSS_ATTN_MODEL_CLASSES[model_class_name](
                 image_shape=input_component_shapes[0],
                 info_dim=info_dim,
                 output_size=output_size,
@@ -154,7 +162,7 @@ class ParallelLayer(nn.Module):
         return torch.cat(outputs, dim=-1)
 
     def _cross_attn_block_inputs(self, flat_input, input_component_names, block):
-        """Build the (img, info) input tuple for a CrossAttnFuseHeadModel block."""
+        """Build the (img, info) input tuple for a cross-attention block."""
         # image path: (..., C*H*W) -> (N, C, H, W)
         img = get_subobs_by_components(flat_input, input_component_names, self.input_segments)
         img = img.reshape(-1, *self.input_segments[input_component_names[0]])
@@ -165,7 +173,7 @@ class ParallelLayer(nn.Module):
         return img, info
 
     def _run_one_block(self, flat_input, input_segments, input_component_names, block):
-        if module_is_from_type(block, CrossAttnFuseHeadModel):
+        if module_is_from_type(block, _CROSS_ATTN_BLOCK_TYPES):
             img, info = self._cross_attn_block_inputs(flat_input, input_component_names, block)
             return block(img, info)
         input_for_block = get_subobs_by_components(
@@ -209,7 +217,7 @@ class ParallelLayer(nn.Module):
         block = self._parallel_blocks[block_name]
         block_config = self.block_configs[block_name]
         input_component_names = block_config["component_names"]
-        if module_is_from_type(block, CrossAttnFuseHeadModel):
+        if module_is_from_type(block, _CROSS_ATTN_BLOCK_TYPES):
             # two-input block: the traced module keeps the (image, info) signature,
             # so the deployment side must feed the proprio query as a second input.
             input_for_block = self._cross_attn_block_inputs(flat_input, input_component_names, block)
@@ -233,7 +241,7 @@ class ParallelLayer(nn.Module):
         block_config = self.block_configs[block_name]
         input_component_names = block_config["component_names"]
         input_names = ["input"]
-        if module_is_from_type(block, CrossAttnFuseHeadModel):
+        if module_is_from_type(block, _CROSS_ATTN_BLOCK_TYPES):
             # two-input block: the exported graph keeps the (image, info) signature,
             # so the deployment side must feed the proprio query as a second input.
             input_for_block = self._cross_attn_block_inputs(flat_input, input_component_names, block)
@@ -248,7 +256,7 @@ class ParallelLayer(nn.Module):
             if module_is_from_type(block, Conv2dHeadModel):
                 assert len(input_component_names) == 1, "Conv2dHeadModel only accept one obs component for now"
                 input_for_block = input_for_block.reshape(-1, *self.input_segments[input_component_names[0]])
-        if module_is_from_type(block, (TransformerHeadModel, CrossAttnFuseHeadModel)):
+        if module_is_from_type(block, (TransformerHeadModel,) + _CROSS_ATTN_BLOCK_TYPES):
             torch.backends.cuda.enable_mem_efficient_sdp(False)  # Disable Memory-Efficient Attention
         exported_program = torch.onnx.export(
             block,
