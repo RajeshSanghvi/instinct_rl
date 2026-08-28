@@ -87,10 +87,12 @@ class EncoderActorCriticMixin:
 
     def act(self, observations, **kwargs):
         obs = self.encoders(observations)
+        self.encoder_latents_buf["actor"] = obs
         return super().act(obs, **kwargs)
 
     def act_inference(self, observations):
         obs = self.encoders(observations)
+        self.encoder_latents_buf["actor"] = obs
         return super().act_inference(obs)
 
     def backbone_evaluate(self, flatten_observations, masks=None, hidden_states=None):

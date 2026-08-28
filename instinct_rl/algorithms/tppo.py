@@ -40,6 +40,9 @@ class TPPO(PPO):
         update_times_scale=100,  # a rough estimation of how many times the update will be called
         using_ppo=True,  # If False, compute_losses will skip ppo loss computation and returns to DAGGR
         distillation_loss_coef=1.0,  # can also be string to select a prob function to scale the distillation loss
+        encoder_distillation_loss_coef=0.0,
+        encoder_distillation_student_component=None,
+        encoder_distillation_teacher_component=None,
         distill_target="real",
         buffer_dilation_ratio=1.0,
         lr_scheduler_class_name=None,
@@ -69,6 +72,26 @@ class TPPO(PPO):
             self.teacher_act_prob = lambda x: self.__teacher_act_prob
         self.using_ppo = using_ppo
         self.__distillation_loss_coef = distillation_loss_coef
+        if not isinstance(encoder_distillation_loss_coef, (int, float)):
+            raise TypeError("encoder_distillation_loss_coef must be a fixed numeric value.")
+        self.encoder_distillation_loss_coef = encoder_distillation_loss_coef
+        self.encoder_distillation_student_component = encoder_distillation_student_component
+        self.encoder_distillation_teacher_component = encoder_distillation_teacher_component
+        if (self.encoder_distillation_student_component is None) != (
+            self.encoder_distillation_teacher_component is None
+        ):
+            raise ValueError(
+                "encoder_distillation_student_component and encoder_distillation_teacher_component "
+                "must either both be set or both be None."
+            )
+        if isinstance(self.encoder_distillation_student_component, str):
+            self.encoder_distillation_student_component = (self.encoder_distillation_student_component,)
+        if isinstance(self.encoder_distillation_teacher_component, str):
+            self.encoder_distillation_teacher_component = (self.encoder_distillation_teacher_component,)
+        if self.encoder_distillation_student_component is not None and (
+            len(self.encoder_distillation_student_component) != len(self.encoder_distillation_teacher_component)
+        ):
+            raise ValueError("Student and teacher encoder component lists must have the same length.")
         if isinstance(self.__distillation_loss_coef, str):
             self.distillation_loss_coef_func = GET_PROB_FUNC(self.__distillation_loss_coef, update_times_scale)
         self.distill_target = distill_target
@@ -93,6 +116,8 @@ class TPPO(PPO):
             print(
                 "TPPO Warning: No snapshot loaded for teacher policy. Make sure you have a pretrained teacher network"
             )
+        self.teacher_actor_critic.eval()
+        self.teacher_actor_critic.requires_grad_(False)
 
         # initialize lr scheduler if needed
         if not self.lr_scheduler_class_name is None:
@@ -138,23 +163,62 @@ class TPPO(PPO):
         else:
             self.teacher_policy_normalizer = None
 
+    def _get_teacher_observations(self, obs, critic_obs=None):
+        teacher_obs = critic_obs if critic_obs is not None and self.label_action_with_critic_obs else obs
+        if self.teacher_policy_normalizer is not None:
+            teacher_obs = self.teacher_policy_normalizer(teacher_obs)
+        return teacher_obs
+
     def get_teacher_actions(self, obs, critic_obs=None):
+        teacher_obs = self._get_teacher_observations(obs, critic_obs)
         if critic_obs is not None and self.label_action_with_critic_obs and self.action_labels_from_sample:
-            if self.teacher_policy_normalizer is not None:
-                critic_obs = self.teacher_policy_normalizer(critic_obs)
-            return self.teacher_actor_critic.act(critic_obs).detach()
+            return self.teacher_actor_critic.act(teacher_obs).detach()
         elif critic_obs is not None and self.label_action_with_critic_obs:
-            if self.teacher_policy_normalizer is not None:
-                critic_obs = self.teacher_policy_normalizer(critic_obs)
-            return self.teacher_actor_critic.act_inference(critic_obs).detach()
+            return self.teacher_actor_critic.act_inference(teacher_obs).detach()
         elif self.action_labels_from_sample:
-            if self.teacher_policy_normalizer is not None:
-                obs = self.teacher_policy_normalizer(obs)
-            return self.teacher_actor_critic.act(obs).detach()
+            return self.teacher_actor_critic.act(teacher_obs).detach()
         else:
-            if self.teacher_policy_normalizer is not None:
-                obs = self.teacher_policy_normalizer(obs)
-            return self.teacher_actor_critic.act_inference(obs).detach()
+            return self.teacher_actor_critic.act_inference(teacher_obs).detach()
+
+    def compute_encoder_distill_loss(self, obs, critic_obs=None, masks=None):
+        if not hasattr(self.actor_critic, "encoder_latents_buf"):
+            raise RuntimeError(
+                "encoder_distillation_loss_coef requires the student policy to expose encoder_latents_buf."
+            )
+        if not hasattr(self.teacher_actor_critic, "encoders"):
+            raise RuntimeError(
+                "encoder_distillation_loss_coef requires the teacher policy to expose an 'encoders' module."
+            )
+
+        if self.encoder_distillation_student_component is None:
+            student_features = self.actor_critic.encoder_latents_buf.get("actor")
+            if student_features is None:
+                raise RuntimeError("Student encoder features are unavailable after the actor forward pass.")
+            with torch.no_grad():
+                teacher_features = self.teacher_actor_critic.encoders(
+                    self._get_teacher_observations(obs, critic_obs)
+                )
+        else:
+            student_features = self.actor_critic.encoders.get_block_outputs(
+                obs, self.encoder_distillation_student_component
+            )
+            with torch.no_grad():
+                teacher_features = self.teacher_actor_critic.encoders.get_block_outputs(
+                    self._get_teacher_observations(obs, critic_obs),
+                    self.encoder_distillation_teacher_component,
+                )
+
+        if self.actor_critic.is_recurrent and masks is not None:
+            student_features = unpad_trajectories(student_features, masks)
+            teacher_features = unpad_trajectories(teacher_features, masks)
+
+        if student_features.shape != teacher_features.shape:
+            raise RuntimeError(
+                "Student and teacher encoder outputs must have identical shapes for encoder distillation, "
+                f"got {tuple(student_features.shape)} and {tuple(teacher_features.shape)}."
+            )
+
+        return F.mse_loss(student_features, teacher_features)
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1):
         self.transition = ActionLabelRollout.Transition()
@@ -331,6 +395,12 @@ class TPPO(PPO):
 
         # distillation loss (with teacher actor)
         dist_loss = self.compute_distill_loss(self.actor_critic.action_mean, minibatch.action_labels)
+        if self.encoder_distillation_loss_coef != 0.0:
+            losses["encoder_distillation_loss"] = self.compute_encoder_distill_loss(
+                minibatch.obs,
+                minibatch.critic_obs,
+                minibatch.masks,
+            )
 
         if "tanh" in self.distill_target:
             stats["l1distance"] = (

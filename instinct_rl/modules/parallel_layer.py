@@ -137,6 +137,27 @@ class ParallelLayer(nn.Module):
                 )
         return torch.cat(outputs, dim=-1)
 
+    def get_block_outputs(self, flat_input: torch.Tensor, block_names) -> torch.Tensor:
+        """Return selected encoder block outputs without the passthrough observations."""
+        if isinstance(block_names, str):
+            block_names = (block_names,)
+
+        leading_dim = flat_input.shape[:-1]
+        outputs = []
+        for block_name in block_names:
+            if block_name not in self._parallel_blocks:
+                raise KeyError(f"Unknown encoder block: {block_name}")
+            block = self._parallel_blocks[block_name]
+            output = self._run_one_block(
+                flat_input,
+                self.input_segments,
+                self.block_configs[block_name]["component_names"],
+                block,
+            )
+            outputs.append(output.reshape(*leading_dim, -1))
+
+        return torch.cat(outputs, dim=-1)
+
     def _run_one_block(self, flat_input, input_segments, input_component_names, block):
         input_for_block = get_subobs_by_components(
             flat_input,
